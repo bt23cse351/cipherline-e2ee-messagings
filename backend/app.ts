@@ -39,6 +39,7 @@ export function createApp(): Express {
       service: 'cipherline-e2ee',
       dbReady: db.ready,
       dbMode: db.mode,
+      dbWarning: db.fallbackReason,
     });
   });
 

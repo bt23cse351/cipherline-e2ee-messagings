@@ -113,7 +113,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         await syncVaultPresence(fetchedUser.id);
       } catch (err) {
         if (!active) return;
-        if (err instanceof ApiError && err.status === 401) {
+        if (err instanceof ApiError && (err.status === 401 || err.status === 404)) {
           persistSessionToken(null);
           setUser(null);
           setIdentityKeys(null);

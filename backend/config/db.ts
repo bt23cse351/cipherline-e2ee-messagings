@@ -7,6 +7,7 @@ import { env } from './env.ts';
 let memoryServer: MongoMemoryServer | null = null;
 let activeDbMode: 'external' | 'embedded' = 'external';
 let lastDbError: string | null = null;
+let externalFallbackReason: string | null = null;
 let connectingPromise: Promise<{
   uri: string;
   mode: 'external' | 'embedded';
@@ -14,6 +15,20 @@ let connectingPromise: Promise<{
 
 function isDbConnected(): boolean {
   return mongoose.connection.readyState === 1;
+}
+
+function sanitizeDbReason(rawReason: string): string {
+  const lower = rawReason.toLowerCase();
+  if (lower.includes('bad auth') || lower.includes('authentication failed')) {
+    return 'MongoDB Atlas authentication failed (check username/password and URL-encode special characters like @ or #).';
+  }
+  if (lower.includes('uri') || lower.includes('enotfound') || lower.includes('srv')) {
+    return 'Invalid or unreachable MONGODB_URI host (check Atlas cluster URL and password encoding).';
+  }
+  if (lower.includes('timed out') || lower.includes('server selection')) {
+    return 'Could not reach MongoDB Atlas (check Atlas Network Access allows 0.0.0.0/0).';
+  }
+  return 'External MongoDB connection failed; running on temporary in-memory storage.';
 }
 
 export async function connectDatabase(customUri?: string): Promise<{
@@ -36,6 +51,7 @@ export async function connectDatabase(customUri?: string): Promise<{
     mode: 'external' | 'embedded';
   }> => {
     lastDbError = null;
+    externalFallbackReason = null;
     const targetUri = (customUri || env.mongodbUri || '').trim();
     const isPlaceholderUri =
       targetUri.includes('<') ||
@@ -52,15 +68,21 @@ export async function connectDatabase(customUri?: string): Promise<{
         return { uri: targetUri, mode: 'external' };
       } catch (err) {
         const reason = err instanceof Error ? err.message : 'connection error';
+        externalFallbackReason = sanitizeDbReason(reason);
         console.log(
           `[CipherLine] External MongoDB connection skipped (${reason}); using embedded MongoDB.`
         );
         await mongoose.disconnect().catch(() => {});
       }
     } else if (isPlaceholderUri) {
+      externalFallbackReason =
+        'MONGODB_URI still contains placeholder text (<db_password>).';
       console.log(
         '[CipherLine] MONGODB_URI contains placeholder text (<db_password>); using embedded MongoDB.'
       );
+    } else if (process.env.NODE_ENV === 'production') {
+      externalFallbackReason =
+        'MONGODB_URI is not set in environment variables; running on temporary in-memory storage.';
     }
 
     const usePersistDir =
@@ -153,5 +175,6 @@ export function getDatabaseStatus() {
     ready: isDbConnected(),
     mode: activeDbMode,
     error: lastDbError,
+    fallbackReason: externalFallbackReason,
   };
 }

@@ -36,7 +36,27 @@ export function AuthPages() {
         });
       }
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Authentication failed');
+      let message = err instanceof Error ? err.message : 'Authentication failed';
+      if (mode === 'login' && message.toLowerCase().includes('invalid credentials')) {
+        try {
+          const healthRes = await fetch('/api/health');
+          if (healthRes.ok) {
+            const health = (await healthRes.json()) as {
+              dbMode?: string;
+              dbWarning?: string | null;
+            };
+            if (health.dbMode === 'embedded') {
+              const reason = health.dbWarning
+                ? ` (${health.dbWarning})`
+                : ' (external MongoDB Atlas is not connected, so accounts reset when the server restarts)';
+              message = `${message}. Note: Server is using temporary in-memory database${reason}`;
+            }
+          }
+        } catch {
+          // Keep original error message if health probe fails
+        }
+      }
+      setError(message);
     } finally {
       setSubmitting(false);
     }

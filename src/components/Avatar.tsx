@@ -5,12 +5,12 @@ interface AvatarProps {
 }
 
 const PALETTES = [
-  'bg-teal-700 text-white',
-  'bg-slate-800 text-white',
-  'bg-cyan-800 text-white',
-  'bg-emerald-800 text-white',
-  'bg-indigo-800 text-white',
-  'bg-stone-700 text-white',
+  'bg-gradient-to-br from-teal-600 to-emerald-600 text-white',
+  'bg-gradient-to-br from-sky-600 to-indigo-600 text-white',
+  'bg-gradient-to-br from-indigo-600 to-violet-600 text-white',
+  'bg-gradient-to-br from-cyan-600 to-teal-700 text-white',
+  'bg-gradient-to-br from-emerald-600 to-teal-700 text-white',
+  'bg-gradient-to-br from-amber-500 to-orange-600 text-white',
 ];
 
 function getPaletteIndex(username: string): number {

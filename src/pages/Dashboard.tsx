@@ -3,6 +3,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import type { Socket } from 'socket.io-client';
 import { ChatWindow } from '../components/ChatWindow';
 import { ConversationList } from '../components/ConversationList';
+import { EncryptedHandshakeGraphic } from '../components/GraphicsPrimitives';
 import { UserDirectory } from '../components/UserDirectory';
 import { VaultUnlockModal } from '../components/VaultUnlockModal';
 import { useAuth } from '../context/AuthContext';
@@ -210,8 +211,8 @@ export function Dashboard() {
 
   return (
     <div className="h-screen flex flex-col bg-slate-50 overflow-hidden">
-      <header className="px-5 py-3 bg-white border-b border-slate-200 flex items-center justify-between gap-8 shrink-0">
-        <span className="text-base font-display font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0">
+      <header className="px-5 py-3 bg-slate-900 border-b border-slate-800 text-white flex items-center justify-between gap-8 shrink-0">
+        <span className="text-base font-display font-bold tracking-tight text-white whitespace-nowrap shrink-0">
           CipherLine
         </span>
 
@@ -235,8 +236,8 @@ export function Dashboard() {
               }}
               className={`py-1.5 border-b-2 transition-colors whitespace-nowrap shrink-0 ${
                 activeView === tab.id
-                  ? 'border-teal-700 text-slate-900 font-semibold'
-                  : 'border-transparent text-slate-600 hover:text-slate-900'
+                  ? 'border-teal-400 text-teal-300 font-semibold'
+                  : 'border-transparent text-slate-300 hover:text-white'
               }`}
             >
               {tab.label}
@@ -245,23 +246,26 @@ export function Dashboard() {
         </nav>
 
         <div className="flex items-center gap-3 shrink-0">
-          <span className="hidden md:inline text-xs text-slate-500 whitespace-nowrap">
-            @{user?.username} · {socketConnected ? 'Connected' : 'Reconnecting'}
+          <span className="hidden md:inline text-xs text-slate-300 whitespace-nowrap">
+            @{user?.username} ·{' '}
+            <span className={socketConnected ? 'text-emerald-400' : 'text-amber-300'}>
+              {socketConnected ? 'Connected' : 'Reconnecting'}
+            </span>
           </span>
           {identityKeys ? (
             <button
               type="button"
               onClick={lockVault}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-100 bg-slate-800 border border-slate-700 rounded-lg hover:bg-slate-700 whitespace-nowrap shrink-0"
             >
-              <Lock className="w-3.5 h-3.5" />
+              <Lock className="w-3.5 h-3.5 text-teal-400" />
               <span>Lock Vault</span>
             </button>
           ) : (
             <button
               type="button"
               onClick={() => setShowVaultModal(true)}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 whitespace-nowrap shrink-0"
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-gradient-to-r from-teal-500 to-emerald-500 rounded-lg hover:from-teal-600 hover:to-emerald-600 whitespace-nowrap shrink-0"
             >
               <Unlock className="w-3.5 h-3.5" />
               <span>Unlock Vault</span>
@@ -270,9 +274,9 @@ export function Dashboard() {
           <button
             type="button"
             onClick={() => void logoutAccount()}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-100 bg-slate-800 border border-slate-700 rounded-lg hover:bg-slate-700 whitespace-nowrap shrink-0"
           >
-            <LogOut className="w-3.5 h-3.5" />
+            <LogOut className="w-3.5 h-3.5 text-slate-300" />
             <span>Sign Out</span>
           </button>
         </div>
@@ -311,22 +315,28 @@ export function Dashboard() {
                     onOpenDirectory={() => setActiveView('directory')}
                   />
                 </div>
-                <div className="hidden sm:flex h-full items-center justify-center p-8 bg-slate-50">
-                  <div className="max-w-md text-center space-y-3 bg-white border border-slate-200 rounded-xl p-8">
-                    <h2 className="text-base font-semibold text-slate-900">
-                      Select a Conversation or Start a New Chat
-                    </h2>
-                    <p className="text-xs text-slate-600 leading-relaxed">
-                      Choose an existing encrypted thread from the sidebar or open the directory to
-                      pick another registered user.
-                    </p>
-                    <button
-                      type="button"
-                      onClick={() => setActiveView('directory')}
-                      className="px-4 py-2 text-xs font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 whitespace-nowrap"
-                    >
-                      Open User Directory
-                    </button>
+                <div className="hidden sm:flex h-full items-center justify-center p-8 bg-chat-canvas">
+                  <div className="max-w-md w-full text-center bg-white border border-slate-200 rounded-xl shadow-xs overflow-hidden">
+                    <div className="h-1.5 bg-gradient-to-r from-teal-500 via-sky-500 to-indigo-500" />
+                    <div className="p-8 space-y-4">
+                      <EncryptedHandshakeGraphic />
+                      <div className="space-y-1.5">
+                        <h2 className="text-base font-semibold text-slate-900">
+                          Select a Conversation or Start a New Chat
+                        </h2>
+                        <p className="text-xs text-slate-600 leading-relaxed">
+                          Choose an existing encrypted thread from the sidebar or open the
+                          directory to connect with another registered user.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setActiveView('directory')}
+                        className="px-4 py-2 text-xs font-semibold text-white bg-gradient-to-r from-teal-600 to-cyan-600 rounded-lg hover:from-teal-700 hover:to-cyan-700 shadow-xs whitespace-nowrap"
+                      >
+                        Open User Directory
+                      </button>
+                    </div>
                   </div>
                 </div>
               </>

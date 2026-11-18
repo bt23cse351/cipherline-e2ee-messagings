@@ -114,7 +114,7 @@ export function UserDirectory({
                     type="button"
                     disabled={!hasKeys || startingUserId === contact.id}
                     onClick={() => void handleStart(contact)}
-                    className="inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
+                    className="inline-flex items-center justify-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-gradient-to-r from-teal-600 to-cyan-600 rounded-lg hover:from-teal-700 hover:to-cyan-700 disabled:opacity-50 transition-all shadow-xs whitespace-nowrap shrink-0"
                   >
                     <MessageSquarePlus className="w-3.5 h-3.5" />
                     <span>

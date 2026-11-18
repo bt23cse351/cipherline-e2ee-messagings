@@ -1,5 +1,6 @@
 import { RefreshCw, ShieldCheck } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
+import { CryptoPipelineDiagram } from '../components/GraphicsPrimitives';
 import { useAuth } from '../context/AuthContext';
 import { api } from '../services/api';
 import type { SecurityLogEntry } from '../types/messaging';
@@ -69,24 +70,28 @@ export function SecurityDetailsView() {
   return (
     <div className="h-full overflow-y-auto bg-slate-50 p-6">
       <div className="max-w-5xl mx-auto space-y-6">
-        <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
-          <div className="flex items-start gap-3">
-            <ShieldCheck className="w-5 h-5 text-teal-700 shrink-0 mt-0.5" />
+        <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
+          <div className="flex items-start gap-3.5">
+            <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-teal-600 to-cyan-600 text-white flex items-center justify-center shrink-0 mt-0.5">
+              <ShieldCheck className="w-5 h-5" />
+            </div>
             <div>
               <h1 className="text-lg font-semibold text-slate-900">
                 Cryptographic Protocol &amp; Honest Threat Model
               </h1>
-              <p className="text-xs text-slate-600 mt-1">
+              <p className="text-xs text-slate-600 mt-1 leading-relaxed">
                 Every primitive in CipherLine uses audited libsodium and Web Crypto APIs. Private
                 keys, shared secrets, and plaintext messages never leave the browser.
               </p>
             </div>
           </div>
 
+          <CryptoPipelineDiagram />
+
           <div className="overflow-x-auto border border-slate-200 rounded-lg">
             <table className="w-full text-left border-collapse">
               <thead>
-                <tr className="bg-slate-50 border-b border-slate-200 text-xs font-semibold text-slate-700">
+                <tr className="bg-slate-900 border-b border-slate-800 text-xs font-semibold text-teal-200">
                   <th className="py-2.5 px-4">Security Layer</th>
                   <th className="py-2.5 px-4">Algorithm / Parameters</th>
                   <th className="py-2.5 px-4">Role</th>

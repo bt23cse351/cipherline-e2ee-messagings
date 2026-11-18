@@ -85,7 +85,7 @@ export function ConversationList({
             <button
               type="button"
               onClick={onOpenDirectory}
-              className="px-3.5 py-2 text-xs font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 transition-colors whitespace-nowrap"
+              className="px-3.5 py-2 text-xs font-semibold text-white bg-gradient-to-r from-teal-600 to-cyan-600 rounded-lg hover:from-teal-700 hover:to-cyan-700 transition-all whitespace-nowrap"
             >
               Browse User Directory
             </button>
@@ -105,7 +105,9 @@ export function ConversationList({
                 type="button"
                 onClick={() => onSelectConversation(conv.id)}
                 className={`w-full text-left px-4 py-3.5 flex items-center gap-3 transition-colors ${
-                  isSelected ? 'bg-teal-50/70' : 'hover:bg-slate-50'
+                  isSelected
+                    ? 'bg-gradient-to-r from-teal-50 to-sky-50/70'
+                    : 'hover:bg-slate-50'
                 }`}
               >
                 <Avatar username={peer.username} isOnline={peer.isOnline} size="md" />

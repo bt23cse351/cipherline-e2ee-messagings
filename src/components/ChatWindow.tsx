@@ -26,6 +26,7 @@ import type {
 } from '../types/messaging';
 import { Avatar } from './Avatar';
 import { CryptoInspectorModal } from './CryptoInspectorModal';
+import { EncryptedHandshakeGraphic } from './GraphicsPrimitives';
 
 interface ChatWindowProps {
   conversation: ConversationSummary;
@@ -419,7 +420,7 @@ export function ChatWindow({
         <button
           type="button"
           onClick={() => setShowFingerprintDrawer((prev) => !prev)}
-          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0"
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-teal-800 bg-teal-50 border border-teal-200 rounded-lg hover:bg-teal-100 transition-colors whitespace-nowrap shrink-0"
         >
           <KeyRound className="w-3.5 h-3.5 text-teal-700" />
           <span>{showFingerprintDrawer ? 'Hide Keys' : 'Verify Keys'}</span>
@@ -489,7 +490,7 @@ export function ChatWindow({
         </div>
       )}
 
-      <div className="flex-1 overflow-y-auto px-6 py-5 space-y-4 bg-slate-50/50">
+      <div className="flex-1 overflow-y-auto px-6 py-5 space-y-4 bg-chat-canvas">
         {!identityKeys && (
           <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div className="flex items-start gap-2.5">
@@ -518,12 +519,10 @@ export function ChatWindow({
             ))}
           </div>
         ) : decryptedMessages.length === 0 ? (
-          <div className="py-16 text-center max-w-sm mx-auto space-y-2">
-            <div className="w-10 h-10 rounded-lg bg-white border border-slate-200 text-teal-700 flex items-center justify-center mx-auto">
-              <Lock className="w-4 h-4" />
-            </div>
+          <div className="py-14 text-center max-w-sm mx-auto space-y-3 bg-white/90 border border-slate-200 rounded-xl p-6">
+            <EncryptedHandshakeGraphic />
             <p className="text-sm font-semibold text-slate-900">End-to-End Encrypted Channel</p>
-            <p className="text-xs text-slate-500">
+            <p className="text-xs text-slate-500 leading-relaxed">
               Messages sent here are encrypted with XChaCha20-Poly1305 and signed with Ed25519
               before leaving your browser.
             </p>
@@ -541,12 +540,12 @@ export function ChatWindow({
                 className={`flex flex-col ${isMine ? 'items-end' : 'items-start'}`}
               >
                 <div
-                  className={`max-w-[80%] sm:max-w-[70%] rounded-xl px-4 py-2.5 border ${
+                  className={`max-w-[80%] sm:max-w-[70%] rounded-xl px-4 py-2.5 border shadow-xs ${
                     item.status === 'SIGNATURE_INVALID' || item.status === 'CIPHERTEXT_TAMPERED'
                       ? 'bg-rose-50 border-rose-300 text-rose-900'
                       : isMine
-                      ? 'bg-slate-900 border-slate-900 text-white'
-                      : 'bg-white border-slate-200 text-slate-900'
+                      ? 'bg-gradient-to-br from-teal-700 to-cyan-700 border-teal-800/30 text-white'
+                      : 'bg-white border-sky-200/80 text-slate-900'
                   }`}
                 >
                   {item.status === 'VERIFIED' ? (
@@ -572,7 +571,7 @@ export function ChatWindow({
                       item.status === 'SIGNATURE_INVALID' || item.status === 'CIPHERTEXT_TAMPERED'
                         ? 'text-rose-700'
                         : isMine
-                        ? 'text-slate-300'
+                        ? 'text-teal-100'
                         : 'text-slate-400'
                     }`}
                   >
@@ -596,11 +595,11 @@ export function ChatWindow({
                           }
                         >
                           {item.envelope.readAt ? (
-                            <CheckCheck className="w-3.5 h-3.5 text-teal-400" />
+                            <CheckCheck className="w-3.5 h-3.5 text-emerald-300" />
                           ) : item.envelope.deliveredAt ? (
-                            <CheckCheck className="w-3.5 h-3.5 text-slate-400" />
+                            <CheckCheck className="w-3.5 h-3.5 text-teal-200" />
                           ) : (
-                            <Check className="w-3.5 h-3.5 text-slate-400" />
+                            <Check className="w-3.5 h-3.5 text-teal-200" />
                           )}
                         </span>
                       )}
@@ -611,8 +610,8 @@ export function ChatWindow({
                       onClick={() => setInspectedMessage(item)}
                       className={`inline-flex items-center gap-1 text-xs hover:underline whitespace-nowrap ${
                         isMine
-                          ? 'text-slate-300 hover:text-white'
-                          : 'text-slate-500 hover:text-slate-800'
+                          ? 'text-teal-100 hover:text-white'
+                          : 'text-teal-700 hover:text-teal-900'
                       }`}
                     >
                       <Eye className="w-3 h-3" />
@@ -650,7 +649,7 @@ export function ChatWindow({
           <button
             type="submit"
             disabled={!identityKeys || sending || !draft.trim()}
-            className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
+            className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-semibold text-white bg-gradient-to-r from-teal-600 to-cyan-600 rounded-lg hover:from-teal-700 hover:to-cyan-700 disabled:opacity-50 transition-all shadow-xs whitespace-nowrap shrink-0"
           >
             <Send className="w-3.5 h-3.5" />
             <span>{sending ? 'Encrypting...' : 'Send Encrypted'}</span>

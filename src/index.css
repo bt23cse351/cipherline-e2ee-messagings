@@ -39,6 +39,20 @@
   font-variant-numeric: tabular-nums;
 }
 
+.bg-auth-canvas {
+  background-color: #f0fdfa;
+  background-image:
+    radial-gradient(at 10% 15%, rgba(20, 184, 166, 0.14) 0px, transparent 48%),
+    radial-gradient(at 88% 12%, rgba(14, 165, 233, 0.14) 0px, transparent 45%),
+    radial-gradient(at 75% 88%, rgba(99, 102, 241, 0.12) 0px, transparent 48%);
+}
+
+.bg-chat-canvas {
+  background-color: #f1f7fa;
+  background-image: radial-gradient(#cbd5e1 0.9px, transparent 0.9px);
+  background-size: 18px 18px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,

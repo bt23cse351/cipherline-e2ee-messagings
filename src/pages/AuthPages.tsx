@@ -63,12 +63,12 @@ export function AuthPages() {
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col">
-      <header className="px-6 sm:px-10 py-5 border-b border-slate-200 bg-white flex items-center justify-between gap-6">
-        <span className="text-lg font-display font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0">
+    <div className="min-h-screen bg-auth-canvas flex flex-col">
+      <header className="px-6 sm:px-10 py-4 border-b border-slate-800 bg-slate-900 flex items-center justify-between gap-6">
+        <span className="text-lg font-display font-bold tracking-tight text-white whitespace-nowrap shrink-0">
           CipherLine
         </span>
-        <div className="flex items-center gap-4 text-xs text-slate-600">
+        <div className="flex items-center gap-4 text-xs text-teal-300">
           <span className="hidden sm:inline whitespace-nowrap">
             X25519 · HKDF-SHA256 · XChaCha20-Poly1305 · Ed25519
           </span>
@@ -78,11 +78,14 @@ export function AuthPages() {
       <main className="flex-1 max-w-6xl w-full mx-auto px-6 py-10 lg:py-16 grid grid-cols-1 lg:grid-cols-12 gap-10 lg:gap-14 items-center">
         <section className="lg:col-span-6 space-y-6">
           <div className="space-y-3">
-            <p className="text-xs font-medium text-teal-700 tracking-wide">
+            <p className="text-xs font-semibold text-teal-700 tracking-wide">
               End-to-End Encrypted 1-to-1 Messaging
             </p>
             <h1 className="text-3xl sm:text-4xl font-display font-bold text-slate-900 tracking-tight leading-tight text-balance">
-              Zero-plaintext messaging verified on your device.
+              Zero-plaintext messaging{' '}
+              <span className="bg-gradient-to-r from-teal-700 via-cyan-700 to-indigo-700 bg-clip-text text-transparent">
+                verified on your device.
+              </span>
             </h1>
             <p className="text-sm sm:text-base text-slate-600 leading-relaxed max-w-xl">
               Your browser generates X25519 encryption and Ed25519 signing keys locally before any
@@ -91,9 +94,11 @@ export function AuthPages() {
             </p>
           </div>
 
-          <div className="border border-slate-200 rounded-xl bg-white divide-y divide-slate-200">
-            <div className="p-4 flex items-start gap-3">
-              <KeyRound className="w-4 h-4 text-teal-700 shrink-0 mt-0.5" />
+          <div className="border border-slate-200/90 rounded-xl bg-white/95 shadow-xs divide-y divide-slate-200/80 overflow-hidden">
+            <div className="p-4 flex items-start gap-3.5 bg-gradient-to-r from-teal-50/50 to-transparent">
+              <div className="w-8 h-8 rounded-lg bg-teal-600 text-white flex items-center justify-center shrink-0 mt-0.5">
+                <KeyRound className="w-4 h-4" />
+              </div>
               <div>
                 <h2 className="text-sm font-semibold text-slate-900">
                   Client-Side Key Generation &amp; Vault
@@ -104,8 +109,10 @@ export function AuthPages() {
                 </p>
               </div>
             </div>
-            <div className="p-4 flex items-start gap-3">
-              <Lock className="w-4 h-4 text-teal-700 shrink-0 mt-0.5" />
+            <div className="p-4 flex items-start gap-3.5 bg-gradient-to-r from-sky-50/50 to-transparent">
+              <div className="w-8 h-8 rounded-lg bg-sky-600 text-white flex items-center justify-center shrink-0 mt-0.5">
+                <Lock className="w-4 h-4" />
+              </div>
               <div>
                 <h2 className="text-sm font-semibold text-slate-900">
                   X25519 + HKDF-SHA256 + XChaCha20-Poly1305
@@ -116,8 +123,10 @@ export function AuthPages() {
                 </p>
               </div>
             </div>
-            <div className="p-4 flex items-start gap-3">
-              <ShieldCheck className="w-4 h-4 text-teal-700 shrink-0 mt-0.5" />
+            <div className="p-4 flex items-start gap-3.5 bg-gradient-to-r from-indigo-50/50 to-transparent">
+              <div className="w-8 h-8 rounded-lg bg-indigo-600 text-white flex items-center justify-center shrink-0 mt-0.5">
+                <ShieldCheck className="w-4 h-4" />
+              </div>
               <div>
                 <h2 className="text-sm font-semibold text-slate-900">
                   Ed25519 Signatures &amp; Safety Numbers
@@ -132,7 +141,8 @@ export function AuthPages() {
         </section>
 
         <section className="lg:col-span-6">
-          <div className="max-w-md mx-auto bg-white border border-slate-200 rounded-xl shadow-xs overflow-hidden">
+          <div className="max-w-md mx-auto bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+            <div className="h-1.5 bg-gradient-to-r from-teal-500 via-sky-500 to-indigo-500" />
             <div className="p-6 pb-4 border-b border-slate-200">
               <div className="flex items-center gap-1 p-1 bg-slate-100 rounded-lg">
                 <button
@@ -143,7 +153,7 @@ export function AuthPages() {
                   }}
                   className={`flex-1 px-4 py-2 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
                     mode === 'login'
-                      ? 'bg-white text-slate-900 shadow-xs'
+                      ? 'bg-white text-teal-800 shadow-xs font-semibold'
                       : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
@@ -157,7 +167,7 @@ export function AuthPages() {
                   }}
                   className={`flex-1 px-4 py-2 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
                     mode === 'register'
-                      ? 'bg-white text-slate-900 shadow-xs'
+                      ? 'bg-white text-teal-800 shadow-xs font-semibold'
                       : 'text-slate-600 hover:text-slate-900'
                   }`}
                 >
@@ -283,7 +293,7 @@ export function AuthPages() {
               <button
                 type="submit"
                 disabled={submitting}
-                className="w-full py-2.5 px-4 text-sm font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-60 transition-colors whitespace-nowrap"
+                className="w-full py-2.5 px-4 text-sm font-semibold text-white bg-gradient-to-r from-teal-600 to-cyan-600 rounded-lg hover:from-teal-700 hover:to-cyan-700 disabled:opacity-60 transition-all shadow-xs whitespace-nowrap"
               >
                 {submitting
                   ? mode === 'login'

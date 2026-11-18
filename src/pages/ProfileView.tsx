@@ -1,5 +1,6 @@
 import { Check, Copy, KeyRound, Lock, RefreshCw, ShieldCheck } from 'lucide-react';
 import { useState } from 'react';
+import { FingerprintIdenticon } from '../components/GraphicsPrimitives';
 import { useAuth } from '../context/AuthContext';
 import { formatFingerprint } from '../crypto/e2ee';
 
@@ -40,13 +41,16 @@ export function ProfileView({ onOpenVaultModal }: ProfileViewProps) {
       <div className="max-w-4xl mx-auto space-y-6">
         <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-200 pb-4">
-            <div>
-              <h1 className="text-lg font-semibold text-slate-900">
-                Identity Keys &amp; Local Vault
-              </h1>
-              <p className="text-xs text-slate-600 mt-0.5">
-                Signed in as @{user.username} ({user.email}) · Key Version v{user.keyVersion}
-              </p>
+            <div className="flex items-center gap-4">
+              <FingerprintIdenticon fingerprint={user.fingerprint} />
+              <div>
+                <h1 className="text-lg font-semibold text-slate-900">
+                  Identity Keys &amp; Local Vault
+                </h1>
+                <p className="text-xs text-slate-600 mt-0.5">
+                  Signed in as @{user.username} ({user.email}) · Key Version v{user.keyVersion}
+                </p>
+              </div>
             </div>
             <div className="flex items-center gap-2.5 shrink-0">
               {identityKeys ? (
@@ -62,7 +66,7 @@ export function ProfileView({ onOpenVaultModal }: ProfileViewProps) {
               <button
                 type="button"
                 onClick={onOpenVaultModal}
-                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 whitespace-nowrap"
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-gradient-to-r from-teal-600 to-cyan-600 rounded-lg hover:from-teal-700 hover:to-cyan-700 shadow-xs whitespace-nowrap"
               >
                 <RefreshCw className="w-3.5 h-3.5" />
                 <span>{identityKeys ? 'Manage / Rotate Keys' : 'Unlock Vault'}</span>
@@ -71,8 +75,16 @@ export function ProfileView({ onOpenVaultModal }: ProfileViewProps) {
           </div>
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-            <div className="p-4 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
-              <span className="text-slate-500">Local Key Vault Status</span>
+            <div
+              className={`p-4 rounded-lg border space-y-1 ${
+                identityKeys
+                  ? 'bg-emerald-50/70 border-emerald-200'
+                  : vaultExists
+                  ? 'bg-amber-50/70 border-amber-200'
+                  : 'bg-rose-50/70 border-rose-200'
+              }`}
+            >
+              <span className="text-slate-600">Local Key Vault Status</span>
               <div className="flex items-center gap-1.5 font-semibold text-slate-900">
                 {identityKeys ? (
                   <>
@@ -92,8 +104,8 @@ export function ProfileView({ onOpenVaultModal }: ProfileViewProps) {
                 )}
               </div>
             </div>
-            <div className="p-4 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
-              <span className="text-slate-500">Private Key Exposure</span>
+            <div className="p-4 rounded-lg bg-sky-50/70 border border-sky-200 space-y-1">
+              <span className="text-slate-600">Private Key Exposure</span>
               <p className="font-semibold text-slate-900">
                 Zero server transmission (PBKDF2 + AES-GCM local only)
               </p>

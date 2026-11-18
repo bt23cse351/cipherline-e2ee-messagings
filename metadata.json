@@ -1,0 +1,6 @@
+{
+  "name": "CipherLine — E2EE Secure Messaging System",
+  "description": "End-to-end encrypted real-time messaging application using X25519 key exchange, HKDF-SHA256, XChaCha20-Poly1305, Ed25519 digital signatures, Argon2id authentication, Socket.IO, and MongoDB.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

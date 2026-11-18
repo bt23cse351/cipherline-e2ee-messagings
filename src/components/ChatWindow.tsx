@@ -1,551 +1,679 @@
-import React, { useEffect, useRef, useState } from 'react';
 import {
-  AlertTriangle,
-  ArrowLeft,
   Check,
   CheckCheck,
-  Code2,
+  Eye,
+  KeyRound,
   Lock,
   Send,
   ShieldAlert,
   ShieldCheck,
 } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
+import type { Socket } from 'socket.io-client';
 import { useAuth } from '../context/AuthContext';
 import {
+  computeSafetyNumber,
   encryptAndSignMessage,
+  formatFingerprint,
   verifyAndDecryptMessage,
 } from '../crypto/e2ee';
 import { api } from '../services/api';
 import type {
   ConversationSummary,
-  DecryptedMessageItem,
+  DecryptedMessage,
   EncryptedMessageEnvelope,
-  PublicUser,
+  UserProfile,
 } from '../types/messaging';
 import { Avatar } from './Avatar';
 import { CryptoInspectorModal } from './CryptoInspectorModal';
 
 interface ChatWindowProps {
   conversation: ConversationSummary;
-  incomingMessages: EncryptedMessageEnvelope[];
-  onBackMobile: () => void;
-  onInspectPeerSecurity: (peer: PublicUser) => void;
-  onMessageSentOrReceived: (msg: EncryptedMessageEnvelope) => void;
+  socket: Socket | null;
+  onUnlockVaultClick: () => void;
+  onConversationActivity: (conversationId: string, envelope: EncryptedMessageEnvelope) => void;
 }
 
 export function ChatWindow({
   conversation,
-  incomingMessages,
-  onBackMobile,
-  onInspectPeerSecurity,
-  onMessageSentOrReceived,
+  socket,
+  onUnlockVaultClick,
+  onConversationActivity,
 }: ChatWindowProps) {
-  const { user, token, keyBundle, socket, socketConnected, verifiedContacts } = useAuth();
+  const {
+    user,
+    token,
+    identityKeys,
+    verifiedContacts,
+    markContactVerified,
+    unverifyContact,
+  } = useAuth();
+
+  const [peerProfile, setPeerProfile] = useState<UserProfile | null>(conversation.peer || null);
   const [envelopes, setEnvelopes] = useState<EncryptedMessageEnvelope[]>([]);
-  const [decryptedItems, setDecryptedItems] = useState<DecryptedMessageItem[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [loadError, setLoadError] = useState('');
+  const [decryptedMessages, setDecryptedMessages] = useState<DecryptedMessage[]>([]);
+  const [loadingMessages, setLoadingMessages] = useState(true);
   const [draft, setDraft] = useState('');
   const [sending, setSending] = useState(false);
-  const [sendError, setSendError] = useState('');
-  const [inspectedItem, setInspectedItem] = useState<DecryptedMessageItem | null>(null);
-  const [peerProfile, setPeerProfile] = useState<PublicUser | undefined>(conversation.peer);
+  const [error, setError] = useState<string | null>(null);
+  const [showFingerprintDrawer, setShowFingerprintDrawer] = useState(false);
+  const [safetyNumber, setSafetyNumber] = useState('');
+  const [inspectedMessage, setInspectedMessage] = useState<DecryptedMessage | null>(null);
 
-  const bottomRef = useRef<HTMLDivElement | null>(null);
+  const reportedSigWarningsRef = useRef<Set<string>>(new Set());
+  const readReceiptSentRef = useRef<Set<string>>(new Set());
+  const messageEndRef = useRef<HTMLDivElement | null>(null);
+
+  const peerId = conversation.peer?.id || '';
 
   useEffect(() => {
-    setPeerProfile(conversation.peer);
-  }, [conversation.peer]);
+    setPeerProfile(conversation.peer || null);
+    setError(null);
+  }, [conversation]);
 
-  // Fetch conversation history + latest peer public keys
   useEffect(() => {
-    if (!token || !conversation.peer?.id) return;
+    if (!token || !peerId) return;
     let active = true;
-    setLoading(true);
-    setLoadError('');
-
-    const peerId = conversation.peer.id;
-    const loadHistory = async () => {
-      try {
-        const [msgsRes, peerRes] = await Promise.all([
-          api.getMessages(token, conversation.id),
-          api.getUserById(token, peerId),
-        ]);
-        if (!active) return;
-        if (peerRes?.user) {
-          setPeerProfile(peerRes.user);
+    api
+      .getUserById(token, peerId)
+      .then(({ user: freshPeer }) => {
+        if (active && freshPeer?.id) {
+          setPeerProfile(freshPeer);
         }
-        setEnvelopes(msgsRes.messages);
-      } catch (err) {
-        if (active) {
-          setLoadError(err instanceof Error ? err.message : 'Failed to load message history');
-        }
-      } finally {
-        if (active) setLoading(false);
-      }
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
     };
+  }, [token, peerId]);
 
-    loadHistory();
-
-    if (socket && socketConnected) {
-      socket.emit('conversation:join', { conversationId: conversation.id });
+  useEffect(() => {
+    const myFp = identityKeys?.fingerprint || user?.fingerprint || '';
+    const peerFp = peerProfile?.fingerprint || '';
+    if (!myFp || !peerFp) {
+      setSafetyNumber('');
+      return;
     }
+    void computeSafetyNumber(myFp, peerFp).then(setSafetyNumber);
+  }, [identityKeys?.fingerprint, user?.fingerprint, peerProfile?.fingerprint]);
+
+  useEffect(() => {
+    if (!token || !conversation.id) return;
+    let active = true;
+    setLoadingMessages(true);
+
+    api
+      .getMessages(token, conversation.id)
+      .then(({ messages }) => {
+        if (active) {
+          setEnvelopes(messages);
+        }
+      })
+      .catch((err) => {
+        if (active) {
+          setError(err instanceof Error ? err.message : 'Unable to load encrypted messages');
+        }
+      })
+      .finally(() => {
+        if (active) setLoadingMessages(false);
+      });
 
     return () => {
       active = false;
     };
-  }, [conversation.id, conversation.peer?.id, socket, socketConnected, token]);
+  }, [token, conversation.id]);
 
-  // Merge live incoming / updated envelopes idempotently
   useEffect(() => {
-    if (incomingMessages.length === 0) return;
-    setEnvelopes((prev) => {
-      const map = new Map<string, EncryptedMessageEnvelope>();
-      for (const m of prev) {
-        map.set(m.messageId, m);
-      }
-      let changed = false;
-      for (const incoming of incomingMessages) {
-        if (incoming.conversationId !== conversation.id) continue;
-        const existing = map.get(incoming.messageId);
-        if (
-          !existing ||
-          existing.deliveredAt !== incoming.deliveredAt ||
-          existing.readAt !== incoming.readAt
-        ) {
-          map.set(incoming.messageId, { ...existing, ...incoming });
-          changed = true;
-        }
-      }
-      if (!changed) return prev;
-      return Array.from(map.values()).sort(
-        (a, b) =>
-          new Date(a.clientTimestamp).getTime() - new Date(b.clientTimestamp).getTime()
-      );
-    });
-  }, [conversation.id, incomingMessages]);
+    if (!socket || !conversation.id) return;
 
-  // Verify Ed25519 signature and decrypt all envelopes client-side
+    socket.emit('conversation:join', conversation.id);
+
+    const handleNewMessage = (incoming: EncryptedMessageEnvelope) => {
+      if (incoming.conversationId !== conversation.id) return;
+      setEnvelopes((prev) => {
+        if (prev.some((m) => m.messageId === incoming.messageId)) {
+          return prev;
+        }
+        return [...prev, incoming];
+      });
+      if (user && incoming.recipientId === user.id) {
+        socket.emit('message:delivered', {
+          id: incoming.id,
+          messageId: incoming.messageId,
+        });
+      }
+    };
+
+    const handleDelivered = (ack: {
+      id?: string;
+      messageId: string;
+      conversationId: string;
+      deliveredAt: string;
+    }) => {
+      if (ack.conversationId !== conversation.id) return;
+      setEnvelopes((prev) =>
+        prev.map((m) =>
+          m.messageId === ack.messageId ? { ...m, deliveredAt: ack.deliveredAt } : m
+        )
+      );
+    };
+
+    const handleRead = (ack: {
+      id?: string;
+      messageId: string;
+      conversationId: string;
+      deliveredAt: string;
+      readAt: string;
+    }) => {
+      if (ack.conversationId !== conversation.id) return;
+      setEnvelopes((prev) =>
+        prev.map((m) =>
+          m.messageId === ack.messageId
+            ? { ...m, deliveredAt: ack.deliveredAt, readAt: ack.readAt }
+            : m
+        )
+      );
+    };
+
+    const handleUserOnline = (evt: { userId: string; lastSeen: string }) => {
+      if (evt.userId === peerId) {
+        setPeerProfile((prev) =>
+          prev ? { ...prev, isOnline: true, lastSeen: evt.lastSeen } : prev
+        );
+      }
+    };
+
+    const handleUserOffline = (evt: { userId: string; lastSeen: string }) => {
+      if (evt.userId === peerId) {
+        setPeerProfile((prev) =>
+          prev ? { ...prev, isOnline: false, lastSeen: evt.lastSeen } : prev
+        );
+      }
+    };
+
+    socket.on('message:new', handleNewMessage);
+    socket.on('message:delivered', handleDelivered);
+    socket.on('message:read', handleRead);
+    socket.on('user:online', handleUserOnline);
+    socket.on('user:offline', handleUserOffline);
+
+    return () => {
+      socket.emit('conversation:leave', conversation.id);
+      socket.off('message:new', handleNewMessage);
+      socket.off('message:delivered', handleDelivered);
+      socket.off('message:read', handleRead);
+      socket.off('user:online', handleUserOnline);
+      socket.off('user:offline', handleUserOffline);
+    };
+  }, [socket, conversation.id, peerId, user]);
+
   useEffect(() => {
     let active = true;
-    const processAll = async () => {
+
+    async function decryptAll() {
       if (!user) return;
-      if (!keyBundle) {
-        setDecryptedItems(
-          envelopes.map((envelope) => ({
-            envelope,
-            plaintext: '',
-            signatureValid: false,
-            decryptionOk: false,
-            errorType: 'VAULT_LOCKED',
-            securityError: 'Unlock your local key vault to verify and decrypt this message.',
-          }))
-        );
+      if (!identityKeys) {
+        if (active) {
+          setDecryptedMessages(
+            envelopes.map((envelope) => ({
+              envelope,
+              plaintext: '',
+              status: 'LOCKED',
+              errorReason: 'Unlock your local key vault to decrypt messages.',
+            }))
+          );
+        }
         return;
       }
 
-      if (!peerProfile) return;
+      const peerEncPub = peerProfile?.encryptionPublicKey || '';
+      const peerSignPub = peerProfile?.signingPublicKey || '';
 
-      const items = await Promise.all(
-        envelopes.map(async (envelope): Promise<DecryptedMessageItem> => {
-          const senderSignPub =
-            envelope.senderId === user.id
-              ? keyBundle.signingPublicKey
-              : peerProfile.signingPublicKey;
+      const results = await Promise.all(
+        envelopes.map(async (envelope): Promise<DecryptedMessage> => {
+          const isOutgoing = envelope.senderId === user.id;
+          const senderSignPub = isOutgoing ? identityKeys.signingPublicKey : peerSignPub;
 
           const res = await verifyAndDecryptMessage({
             envelope,
-            myUserId: user.id,
-            myKeys: keyBundle,
-            senderSigningPublicKey: senderSignPub,
-            peerEncryptionPublicKey: peerProfile.encryptionPublicKey,
+            myEncPrivateKeyB64: identityKeys.encryptionPrivateKey,
+            peerEncPublicKeyB64: peerEncPub,
+            senderSignPublicKeyB64: senderSignPub,
           });
 
-          if (!res.ok && res.errorType === 'SIGNATURE_INVALID' && token) {
-            api.reportSignatureWarning(token, envelope.messageId).catch(() => {});
+          if (
+            !res.ok &&
+            res.status === 'SIGNATURE_INVALID' &&
+            token &&
+            !reportedSigWarningsRef.current.has(envelope.messageId)
+          ) {
+            reportedSigWarningsRef.current.add(envelope.messageId);
+            void api.reportSignatureWarning(token, envelope.messageId).catch(() => {});
           }
 
           return {
             envelope,
             plaintext: res.plaintext,
-            signatureValid: res.signatureValid,
-            decryptionOk: res.ok,
-            securityError: res.error,
-            errorType: res.errorType,
+            status: res.status,
+            errorReason: res.errorReason,
           };
         })
       );
 
       if (active) {
-        setDecryptedItems(items);
+        setDecryptedMessages(results);
       }
-    };
+    }
 
-    processAll();
+    void decryptAll();
     return () => {
       active = false;
     };
-  }, [envelopes, keyBundle, peerProfile, token, user]);
+  }, [
+    envelopes,
+    identityKeys,
+    user,
+    token,
+    peerProfile?.encryptionPublicKey,
+    peerProfile?.signingPublicKey,
+  ]);
 
-  // Send read receipts for unread incoming messages in this open chat
   useEffect(() => {
-    if (!user || !token) return;
+    if (!user || !token || !identityKeys) return;
     const unreadIncoming = envelopes.filter(
-      (m) => m.recipientId === user.id && !m.readAt
+      (m) =>
+        m.recipientId === user.id &&
+        !m.readAt &&
+        !readReceiptSentRef.current.has(m.messageId)
     );
-    if (unreadIncoming.length === 0) return;
 
-    for (const msg of unreadIncoming) {
-      if (socket && socketConnected) {
-        socket.emit('message:read', { messageId: msg.messageId });
+    unreadIncoming.forEach((msg) => {
+      readReceiptSentRef.current.add(msg.messageId);
+      const targetId = msg.id || msg.messageId;
+      if (socket?.connected) {
+        socket.emit('message:read', { id: msg.id, messageId: msg.messageId });
       } else {
-        api.markMessageRead(token, msg.messageId).catch(() => {});
+        void api.markMessageRead(token, targetId).catch(() => {});
       }
-      setEnvelopes((prev) =>
-        prev.map((item) =>
-          item.messageId === msg.messageId
-            ? { ...item, readAt: new Date().toISOString() }
-            : item
-        )
-      );
-    }
-  }, [envelopes, socket, socketConnected, token, user]);
+    });
+  }, [envelopes, user, token, identityKeys, socket]);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [decryptedItems.length]);
+    messageEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [decryptedMessages.length]);
 
-  const handleSend = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!draft.trim() || !user || !token || !keyBundle || !peerProfile) return;
+  const activePeer = peerProfile || conversation.peer;
+  const isVerified = useMemo(() => {
+    if (!activePeer?.id) return false;
+    const record = verifiedContacts[activePeer.id];
+    return Boolean(record && record.fingerprint === activePeer.fingerprint);
+  }, [verifiedContacts, activePeer]);
 
-    const text = draft.trim();
-    setSending(true);
-    setSendError('');
+  const keyChangedWarning = useMemo(() => {
+    if (!activePeer?.id) return false;
+    const record = verifiedContacts[activePeer.id];
+    return Boolean(record && record.fingerprint !== activePeer.fingerprint);
+  }, [verifiedContacts, activePeer]);
 
-    try {
-      const envelope = await encryptAndSignMessage({
-        plaintext: text,
-        conversationId: conversation.id,
-        senderId: user.id,
-        recipientId: peerProfile.id,
-        senderKeys: keyBundle,
-        recipientPublicKeys: {
-          encryptionPublicKey: peerProfile.encryptionPublicKey,
-          signingPublicKey: peerProfile.signingPublicKey,
-          keyVersion: peerProfile.keyVersion,
-        },
-      });
+  const handleSend = useCallback(
+    async (e: FormEvent) => {
+      e.preventDefault();
+      if (!user || !token || !identityKeys || !activePeer?.id) return;
 
-      if (socket && socketConnected) {
-        const persisted = await new Promise<EncryptedMessageEnvelope>((resolve, reject) => {
-          socket.emit(
-            'message:send',
-            envelope,
-            (ack: { ok: boolean; message?: EncryptedMessageEnvelope; error?: string }) => {
-              if (ack?.ok && ack.message) {
-                resolve(ack.message);
-              } else {
-                reject(new Error(ack?.error || 'Socket delivery failed'));
-              }
-            }
-          );
-        });
-        setEnvelopes((prev) => [...prev, persisted]);
-        onMessageSentOrReceived(persisted);
-      } else {
-        const res = await api.sendMessageRest(token, envelope);
-        setEnvelopes((prev) => [...prev, res.message]);
-        onMessageSentOrReceived(res.message);
+      const text = draft.trim();
+      if (!text) return;
+
+      if (!activePeer.encryptionPublicKey || !activePeer.signingPublicKey) {
+        setError('Recipient has not published their X25519/Ed25519 public keys yet.');
+        return;
       }
 
-      setDraft('');
-    } catch (err) {
-      setSendError(err instanceof Error ? err.message : 'Failed to encrypt or send message');
-    } finally {
-      setSending(false);
-    }
-  };
+      setSending(true);
+      setError(null);
 
-  if (!peerProfile) {
+      try {
+        const envelope = await encryptAndSignMessage({
+          plaintext: text,
+          conversationId: conversation.id,
+          senderId: user.id,
+          recipientId: activePeer.id,
+          senderKeys: identityKeys,
+          recipientEncryptionPublicKey: activePeer.encryptionPublicKey,
+          recipientKeyVersion: activePeer.keyVersion || 1,
+        });
+
+        let savedEnvelope: EncryptedMessageEnvelope;
+        if (socket?.connected) {
+          savedEnvelope = await new Promise<EncryptedMessageEnvelope>((resolve, reject) => {
+            socket.emit(
+              'message:send',
+              envelope,
+              (ack: { ok?: boolean; error?: string; message?: EncryptedMessageEnvelope }) => {
+                if (ack?.ok && ack.message) {
+                  resolve(ack.message);
+                } else {
+                  reject(new Error(ack?.error || 'Socket send failed'));
+                }
+              }
+            );
+          });
+        } else {
+          const res = await api.sendMessage(token, envelope);
+          savedEnvelope = res.message;
+        }
+
+        setEnvelopes((prev) => {
+          if (prev.some((m) => m.messageId === savedEnvelope.messageId)) {
+            return prev;
+          }
+          return [...prev, savedEnvelope];
+        });
+        onConversationActivity(conversation.id, savedEnvelope);
+        setDraft('');
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to encrypt and transmit message');
+      } finally {
+        setSending(false);
+      }
+    },
+    [user, token, identityKeys, activePeer, draft, conversation.id, socket, onConversationActivity]
+  );
+
+  if (!activePeer?.id) {
     return (
-      <div className="flex-1 flex flex-col items-center justify-center bg-slate-50 p-6 text-center">
-        <p className="text-sm font-medium text-slate-900">Contact unavailable</p>
-        <p className="mt-1 text-xs text-slate-500">
-          This conversation participant could not be loaded.
-        </p>
-        <button
-          type="button"
-          onClick={onBackMobile}
-          className="mt-4 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 rounded-lg"
-        >
-          Back to Chats
-        </button>
+      <div className="h-full flex items-center justify-center p-8 text-center">
+        <p className="text-sm text-slate-500">Select a conversation to view encrypted messages.</p>
       </div>
     );
   }
 
-  const verifiedRecord = verifiedContacts[peerProfile.id];
-  const isFingerprintVerified =
-    Boolean(verifiedRecord) && verifiedRecord.fingerprint === peerProfile.fingerprint;
-  const keyChangedSinceVerification =
-    Boolean(verifiedRecord) && verifiedRecord.fingerprint !== peerProfile.fingerprint;
-
   return (
-    <div className="flex flex-col h-full bg-slate-50">
-      {/* Chat Header */}
-      <header className="px-4 sm:px-6 py-3.5 bg-white border-b border-slate-200 flex items-center justify-between gap-4 shrink-0">
+    <div className="h-full flex flex-col bg-white">
+      <div className="px-6 py-3.5 border-b border-slate-200 flex items-center justify-between gap-4">
         <div className="flex items-center gap-3 min-w-0">
-          <button
-            type="button"
-            onClick={onBackMobile}
-            className="md:hidden p-1.5 -ml-1.5 text-slate-600 hover:text-slate-900 rounded-lg"
-            aria-label="Back to conversations"
-          >
-            <ArrowLeft className="h-5 w-5" />
-          </button>
-          <Avatar username={peerProfile.username} isOnline={peerProfile.isOnline} showPresence />
+          <Avatar username={activePeer.username} isOnline={activePeer.isOnline} size="md" />
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <h2 className="font-display text-sm sm:text-base font-semibold text-slate-900 truncate">
-                @{peerProfile.username}
+              <h2 className="text-sm font-semibold text-slate-900 truncate">
+                @{activePeer.username}
               </h2>
-              <span className="text-xs text-slate-500 whitespace-nowrap">
-                · {peerProfile.isOnline ? 'Online' : 'Offline'}
-              </span>
+              {isVerified ? (
+                <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 whitespace-nowrap">
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  <span>Verified</span>
+                </span>
+              ) : keyChangedWarning ? (
+                <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 whitespace-nowrap">
+                  <ShieldAlert className="w-3.5 h-3.5" />
+                  <span>Key Changed</span>
+                </span>
+              ) : null}
             </div>
-            <div className="flex items-center gap-1.5 text-[11px] text-slate-500">
-              <Lock className="h-3 w-3 text-teal-700 shrink-0" />
-              <span className="truncate">
-                X25519 · XChaCha20-Poly1305 · Ed25519 Signed
-              </span>
-            </div>
+            <p className="text-xs text-slate-500 truncate">
+              {activePeer.isOnline ? 'Online' : 'Offline'} · X25519 + XChaCha20-Poly1305 · Ed25519
+              Signed
+            </p>
           </div>
         </div>
 
         <button
           type="button"
-          onClick={() => onInspectPeerSecurity(peerProfile)}
-          className={`px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
-            keyChangedSinceVerification
-              ? 'bg-red-50 text-red-800 border-red-200 hover:bg-red-100'
-              : isFingerprintVerified
-                ? 'bg-teal-50 text-teal-800 border-teal-200 hover:bg-teal-100'
-                : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
-          }`}
+          onClick={() => setShowFingerprintDrawer((prev) => !prev)}
+          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors whitespace-nowrap shrink-0"
         >
-          {keyChangedSinceVerification ? (
-            <ShieldAlert className="h-3.5 w-3.5 text-red-700" />
-          ) : (
-            <ShieldCheck className="h-3.5 w-3.5 text-teal-700" />
-          )}
-          <span>
-            {keyChangedSinceVerification
-              ? 'Key Changed'
-              : isFingerprintVerified
-                ? 'Verified Key'
-                : 'Verify Safety Number'}
-          </span>
+          <KeyRound className="w-3.5 h-3.5 text-teal-700" />
+          <span>{showFingerprintDrawer ? 'Hide Keys' : 'Verify Keys'}</span>
         </button>
-      </header>
+      </div>
 
-      {/* Security Banners */}
-      {keyChangedSinceVerification && (
-        <div className="px-4 sm:px-6 py-2.5 bg-amber-50 border-b border-amber-200 text-xs text-amber-900 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2">
-            <AlertTriangle className="h-4 w-4 text-amber-700 shrink-0" />
-            <span>
-              Security Notice: @{peerProfile.username}&apos;s public key fingerprint has changed
-              (now Key v{peerProfile.keyVersion}). Verify their Safety Number out-of-band before
-              sending sensitive information.
-            </span>
-          </div>
+      {keyChangedWarning && (
+        <div className="px-6 py-2.5 bg-amber-50 border-b border-amber-200 text-xs text-amber-900 flex items-center justify-between gap-3">
+          <span>
+            @{activePeer.username}&apos;s public key fingerprint changed since you last verified
+            them. Re-check their safety number out-of-band before sharing sensitive information.
+          </span>
           <button
             type="button"
-            onClick={() => onInspectPeerSecurity(peerProfile)}
-            className="text-xs font-medium underline whitespace-nowrap"
+            onClick={() => setShowFingerprintDrawer(true)}
+            className="font-semibold text-amber-900 underline whitespace-nowrap shrink-0"
           >
             Inspect Key
           </button>
         </div>
       )}
 
-      {!socketConnected && (
-        <div className="px-4 sm:px-6 py-2 bg-slate-800 text-white text-xs flex items-center justify-between">
-          <span>Real-time socket disconnected. Reconnecting automatically...</span>
+      {showFingerprintDrawer && (
+        <div className="px-6 py-4 bg-slate-50 border-b border-slate-200 space-y-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div className="space-y-1">
+              <p className="text-xs font-medium text-slate-600">
+                @{activePeer.username} SHA-256 Public Key Fingerprint (v{activePeer.keyVersion})
+              </p>
+              <p className="text-xs font-mono text-slate-900 bg-white p-2.5 rounded-lg border border-slate-200 break-all">
+                {formatFingerprint(activePeer.fingerprint)}
+              </p>
+            </div>
+            <div className="space-y-1">
+              <p className="text-xs font-medium text-slate-600">
+                Symmetric 60-Digit Safety Number
+              </p>
+              <p className="text-xs font-mono text-slate-900 bg-white p-2.5 rounded-lg border border-slate-200 break-words">
+                {safetyNumber || 'Unlock your vault to compute safety number'}
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center justify-between gap-3 pt-1">
+            <p className="text-xs text-slate-500">
+              Compare these digits in person or via a trusted voice call to rule out MITM key
+              substitution.
+            </p>
+            {isVerified ? (
+              <button
+                type="button"
+                onClick={() => unverifyContact(activePeer.id)}
+                className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-100 whitespace-nowrap shrink-0"
+              >
+                Clear Verification
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => void markContactVerified(activePeer)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-emerald-700 rounded-lg hover:bg-emerald-800 whitespace-nowrap shrink-0"
+              >
+                <ShieldCheck className="w-3.5 h-3.5" />
+                <span>Mark Fingerprint Verified</span>
+              </button>
+            )}
+          </div>
         </div>
       )}
 
-      {/* Messages Viewport */}
-      <div className="flex-1 overflow-y-auto px-4 sm:px-6 py-5 space-y-3">
-        <div className="max-w-md mx-auto text-center py-2 px-3 bg-white border border-slate-200 rounded-lg text-[11px] text-slate-500">
-          Messages in this chat are encrypted end-to-end on your device and signed with
-          Ed25519. Click the code icon on any message to inspect its stored ciphertext.
-        </div>
-
-        {loadError && (
-          <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800">
-            {loadError}
+      <div className="flex-1 overflow-y-auto px-6 py-5 space-y-4 bg-slate-50/50">
+        {!identityKeys && (
+          <div className="p-4 rounded-xl bg-amber-50 border border-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5">
+              <Lock className="w-4 h-4 text-amber-700 shrink-0 mt-0.5" />
+              <div className="text-xs text-amber-900">
+                <p className="font-semibold">Local private key vault is locked</p>
+                <p className="mt-0.5">
+                  Unlock your vault passphrase to decrypt existing messages and sign outgoing chats.
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={onUnlockVaultClick}
+              className="px-3.5 py-2 text-xs font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 whitespace-nowrap shrink-0"
+            >
+              Unlock Vault
+            </button>
           </div>
         )}
 
-        {loading ? (
-          <div className="space-y-3 py-4">
-            {[1, 2, 3].map((n) => (
-              <div
-                key={n}
-                className={`flex ${n % 2 === 0 ? 'justify-end' : 'justify-start'}`}
-              >
-                <div className="h-12 w-56 rounded-xl bg-slate-200/70 animate-pulse" />
-              </div>
+        {loadingMessages ? (
+          <div className="space-y-3">
+            {[1, 2, 3].map((i) => (
+              <div key={i} className="h-16 w-2/3 rounded-xl bg-slate-200/70 animate-pulse" />
             ))}
           </div>
-        ) : decryptedItems.length === 0 ? (
-          <div className="py-12 text-center text-xs text-slate-500">
-            No messages yet. Send an encrypted message below to start the conversation.
+        ) : decryptedMessages.length === 0 ? (
+          <div className="py-16 text-center max-w-sm mx-auto space-y-2">
+            <div className="w-10 h-10 rounded-lg bg-white border border-slate-200 text-teal-700 flex items-center justify-center mx-auto">
+              <Lock className="w-4 h-4" />
+            </div>
+            <p className="text-sm font-semibold text-slate-900">End-to-End Encrypted Channel</p>
+            <p className="text-xs text-slate-500">
+              Messages sent here are encrypted with XChaCha20-Poly1305 and signed with Ed25519
+              before leaving your browser.
+            </p>
           </div>
         ) : (
-          decryptedItems.map((item) => {
-            const { envelope, plaintext, signatureValid, decryptionOk, securityError } = item;
-            const isMine = envelope.senderId === user?.id;
-            const timeLabel = new Date(envelope.clientTimestamp).toLocaleTimeString([], {
-              hour: '2-digit',
-              minute: '2-digit',
-            });
+          decryptedMessages.map((item) => {
+            const isMine = item.envelope.senderId === user?.id;
+            const timeLabel = new Date(
+              item.envelope.clientTimestamp || item.envelope.createdAt || Date.now()
+            ).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 
             return (
               <div
-                key={envelope.messageId}
-                className={`flex ${isMine ? 'justify-end' : 'justify-start'}`}
+                key={item.envelope.messageId}
+                className={`flex flex-col ${isMine ? 'items-end' : 'items-start'}`}
               >
                 <div
-                  className={`group max-w-[85%] sm:max-w-[70%] rounded-2xl px-4 py-2.5 shadow-xs border ${
-                    !signatureValid
-                      ? 'bg-red-50 border-red-300 text-red-950'
-                      : !decryptionOk
-                        ? 'bg-amber-50 border-amber-200 text-amber-950'
-                        : isMine
-                          ? 'bg-teal-800 border-teal-800 text-white'
-                          : 'bg-white border-slate-200 text-slate-900'
+                  className={`max-w-[80%] sm:max-w-[70%] rounded-xl px-4 py-2.5 border ${
+                    item.status === 'SIGNATURE_INVALID' || item.status === 'CIPHERTEXT_TAMPERED'
+                      ? 'bg-rose-50 border-rose-300 text-rose-900'
+                      : isMine
+                      ? 'bg-slate-900 border-slate-900 text-white'
+                      : 'bg-white border-slate-200 text-slate-900'
                   }`}
                 >
-                  {!signatureValid ? (
-                    <div className="space-y-1">
-                      <div className="flex items-center gap-1.5 text-xs font-semibold text-red-800">
-                        <ShieldAlert className="h-4 w-4 shrink-0" />
-                        <span>Signature Verification Failed</span>
-                      </div>
-                      <p className="text-xs text-red-800 leading-relaxed">
-                        {securityError ||
-                          'Message rejected before decryption because the Ed25519 signature is invalid.'}
-                      </p>
-                    </div>
-                  ) : !decryptionOk ? (
-                    <div className="space-y-1">
-                      <div className="flex items-center gap-1.5 text-xs font-medium text-amber-900">
-                        <Lock className="h-3.5 w-3.5 shrink-0" />
-                        <span>Unable to Decrypt</span>
-                      </div>
-                      <p className="text-xs text-amber-800">{securityError}</p>
-                    </div>
-                  ) : (
-                    <p className="text-sm whitespace-pre-wrap break-words leading-relaxed">
-                      {plaintext}
+                  {item.status === 'VERIFIED' ? (
+                    <p className="text-sm leading-relaxed whitespace-pre-wrap break-words">
+                      {item.plaintext}
                     </p>
+                  ) : item.status === 'LOCKED' ? (
+                    <p className="text-xs italic opacity-80">
+                      Encrypted message (unlock key vault to decrypt)
+                    </p>
+                  ) : (
+                    <div className="space-y-1 text-xs">
+                      <div className="flex items-center gap-1.5 font-semibold text-rose-700">
+                        <ShieldAlert className="w-3.5 h-3.5" />
+                        <span>Tampering or Signature Failure ({item.status})</span>
+                      </div>
+                      <p className="text-rose-800">{item.errorReason}</p>
+                    </div>
                   )}
 
                   <div
-                    className={`mt-1.5 flex items-center justify-end gap-2 text-[11px] tabular-nums ${
-                      !signatureValid
-                        ? 'text-red-700'
-                        : !decryptionOk
-                          ? 'text-amber-700'
-                          : isMine
-                            ? 'text-teal-100/80'
-                            : 'text-slate-400'
+                    className={`mt-1.5 flex items-center justify-between gap-4 text-xs tabular-nums ${
+                      item.status === 'SIGNATURE_INVALID' || item.status === 'CIPHERTEXT_TAMPERED'
+                        ? 'text-rose-700'
+                        : isMine
+                        ? 'text-slate-300'
+                        : 'text-slate-400'
                     }`}
                   >
-                    <button
-                      type="button"
-                      onClick={() => setInspectedItem(item)}
-                      className="opacity-75 hover:opacity-100 inline-flex items-center gap-1"
-                      title="Inspect cryptographic envelope"
-                    >
-                      <Code2 className="h-3 w-3" />
-                    </button>
-                    <span>{timeLabel}</span>
-                    {isMine && (
-                      <span
-                        title={
-                          envelope.readAt
-                            ? 'Read'
-                            : envelope.deliveredAt
+                    <div className="flex items-center gap-1.5">
+                      <span>{timeLabel}</span>
+                      {item.status === 'VERIFIED' && (
+                        <>
+                          <span aria-hidden="true">·</span>
+                          <span>Signed</span>
+                        </>
+                      )}
+                      {isMine && (
+                        <span
+                          className="inline-flex items-center"
+                          title={
+                            item.envelope.readAt
+                              ? 'Read'
+                              : item.envelope.deliveredAt
                               ? 'Delivered'
                               : 'Sent'
-                        }
-                      >
-                        {envelope.readAt ? (
-                          <CheckCheck className="h-3.5 w-3.5 text-sky-300" />
-                        ) : envelope.deliveredAt ? (
-                          <CheckCheck className="h-3.5 w-3.5" />
-                        ) : (
-                          <Check className="h-3.5 w-3.5" />
-                        )}
-                      </span>
-                    )}
+                          }
+                        >
+                          {item.envelope.readAt ? (
+                            <CheckCheck className="w-3.5 h-3.5 text-teal-400" />
+                          ) : item.envelope.deliveredAt ? (
+                            <CheckCheck className="w-3.5 h-3.5 text-slate-400" />
+                          ) : (
+                            <Check className="w-3.5 h-3.5 text-slate-400" />
+                          )}
+                        </span>
+                      )}
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={() => setInspectedMessage(item)}
+                      className={`inline-flex items-center gap-1 text-xs hover:underline whitespace-nowrap ${
+                        isMine
+                          ? 'text-slate-300 hover:text-white'
+                          : 'text-slate-500 hover:text-slate-800'
+                      }`}
+                    >
+                      <Eye className="w-3 h-3" />
+                      <span>Inspect</span>
+                    </button>
                   </div>
                 </div>
               </div>
             );
           })
         )}
-        <div ref={bottomRef} />
+        <div ref={messageEndRef} />
       </div>
 
-      {/* Composer */}
-      <form
-        onSubmit={handleSend}
-        className="p-3 sm:p-4 bg-white border-t border-slate-200 shrink-0 space-y-2"
-      >
-        {sendError && (
-          <div className="px-3 py-2 bg-red-50 border border-red-200 rounded-lg text-xs text-red-800">
-            {sendError}
-          </div>
-        )}
-        <div className="flex items-end gap-2.5">
-          <textarea
-            rows={1}
+      {error && (
+        <div className="px-6 py-2 bg-rose-50 border-t border-rose-200 text-xs text-rose-700">
+          {error}
+        </div>
+      )}
+
+      <form onSubmit={handleSend} className="p-4 border-t border-slate-200 bg-white">
+        <div className="flex items-center gap-3">
+          <input
+            type="text"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                handleSend(e);
-              }
-            }}
-            disabled={!keyBundle || sending}
+            disabled={!identityKeys || sending}
             placeholder={
-              keyBundle
-                ? `Write an encrypted message to @${peerProfile.username}...`
-                : 'Unlock key vault to send messages...'
+              identityKeys
+                ? `Encrypt and send message to @${activePeer.username}...`
+                : 'Unlock local key vault to compose messages...'
             }
-            className="flex-1 resize-none px-3.5 py-2.5 text-sm bg-slate-50 border border-slate-300 rounded-xl focus:outline-none focus:ring-2 focus:ring-teal-600 focus:bg-white max-h-32"
+            className="flex-1 px-4 py-2.5 text-sm bg-slate-50 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-teal-600/20 focus:border-teal-600 disabled:opacity-60"
           />
           <button
             type="submit"
-            disabled={!draft.trim() || !keyBundle || sending}
-            className="h-10 px-4 bg-teal-700 hover:bg-teal-800 disabled:opacity-50 text-white text-xs font-medium rounded-xl transition-colors flex items-center gap-1.5 shrink-0"
+            disabled={!identityKeys || sending || !draft.trim()}
+            className="inline-flex items-center gap-2 px-4 py-2.5 text-xs font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 disabled:opacity-50 transition-colors whitespace-nowrap shrink-0"
           >
-            <Send className="h-3.5 w-3.5" />
-            <span>{sending ? 'Encrypting...' : 'Send'}</span>
+            <Send className="w-3.5 h-3.5" />
+            <span>{sending ? 'Encrypting...' : 'Send Encrypted'}</span>
           </button>
         </div>
       </form>
 
-      <CryptoInspectorModal
-        item={inspectedItem}
-        onClose={() => setInspectedItem(null)}
-      />
+      {inspectedMessage && (
+        <CryptoInspectorModal
+          message={inspectedMessage}
+          senderUsername={
+            inspectedMessage.envelope.senderId === user?.id
+              ? user.username
+              : activePeer.username
+          }
+          recipientUsername={
+            inspectedMessage.envelope.recipientId === user?.id
+              ? user.username
+              : activePeer.username
+          }
+          onClose={() => setInspectedMessage(null)}
+        />
+      )}
     </div>
   );
 }

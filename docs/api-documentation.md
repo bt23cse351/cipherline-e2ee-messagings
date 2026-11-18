@@ -1,71 +1,39 @@
-# REST API & Socket.IO Event Documentation
+# API & Socket.IO Documentation
 
-## 1. Authentication & Security Headers
+## REST API Endpoints
 
-All protected endpoints require an HTTP `Authorization: Bearer <jwt>` header.
-Rate limiting (`express-rate-limit`), `helmet` security headers, strict JSON size limits (`128kb`), and Zod validation protect every route.
+### Health
+- `GET /api/health` — Returns `{ status: "ok", service: "cipherline-e2ee", dbReady, dbMode }`.
 
----
+### Authentication (`/api/auth`)
+- `POST /api/auth/register` — Rate-limited. Creates user with Argon2id hash and optional verified public key bundle (`encryptionPublicKey`, `signingPublicKey`, `fingerprint`). Rejects any private key fields.
+- `POST /api/auth/login` — Rate-limited. Returns generic `"Invalid credentials"` on bad username/password.
+- `POST /api/auth/logout` — Protected. Revokes JWT `jti` in `RevokedToken` and marks user offline.
+- `GET /api/auth/me` — Protected. Returns current authenticated user profile.
 
-## 2. REST API Endpoints
+### Users (`/api/users`)
+- `GET /api/users?search=<query>` — Protected. Searches registered users by username (excluding requester).
+- `GET /api/users/:id` — Protected. Returns single user public profile & public keys.
 
-### Auth Routes (`/api/auth`)
+### Keys (`/api/keys`)
+- `POST /api/keys/publish` — Protected. Verifies 32-byte key lengths + SHA-256 fingerprint; increments `keyVersion` on rotation.
+- `GET /api/keys/:userId` — Protected. Returns peer public key bundle.
 
-| Method | Endpoint | Auth | Description |
-| :--- | :--- | :--- | :--- |
-| `POST` | `/api/auth/register` | Public | Registers user with Argon2id password hash and optional verified public keys (`encryptionPublicKey`, `signingPublicKey`, `fingerprint`). Rejects private keys (`400`) or duplicates (`409`). |
-| `POST` | `/api/auth/login` | Public | Verifies Argon2id password hash; returns JWT + user profile or generic `401 Invalid credentials`. |
-| `POST` | `/api/auth/logout` | Bearer | Revokes active JWT `jti` in `RevokedToken`, marks user offline, logs `LOGOUT`. |
-| `GET` | `/api/auth/me` | Bearer | Returns authenticated user's public profile. |
+### Conversations (`/api/conversations`)
+- `POST /api/conversations` — Protected. Creates or retrieves unique 1-to-1 conversation for `{ recipientId }`.
+- `GET /api/conversations` — Protected. Lists conversations with peer status, unread count, and latest encrypted envelope.
 
-### User Directory Routes (`/api/users`)
+### Messages (`/api/messages`)
+- `GET /api/messages/:conversationId` — Protected & membership-checked. Returns up to 500 encrypted envelopes.
+- `POST /api/messages` — Protected & membership-checked. Rejects `plaintext`/`text`, validates Base64 envelope sizes, enforces unique `messageId`.
+- `PATCH /api/messages/:id/read` — Protected (recipient-only). Sets `deliveredAt` and `readAt` and broadcasts `message:read`.
 
-| Method | Endpoint | Auth | Description |
-| :--- | :--- | :--- | :--- |
-| `GET` | `/api/users?search=<q>` | Bearer | Lists/searches registered users (excluding current user) with public keys and online status. |
-| `GET` | `/api/users/:id` | Bearer | Retrieves a specific user's public profile and public keys. |
+### Security (`/api/security`)
+- `GET /api/security/logs` — Protected. Returns latest 50 security audit entries for the authenticated user.
+- `POST /api/security/signature-warning` — Protected. Records client-side Ed25519 verification failures.
 
-### Public Key Exchange Routes (`/api/keys`)
+## Socket.IO Events (`/socket.io`)
 
-| Method | Endpoint | Auth | Description |
-| :--- | :--- | :--- | :--- |
-| `POST` | `/api/keys/publish` | Bearer | Validates 32-byte X25519 + Ed25519 public keys, verifies SHA-256 fingerprint match, increments `keyVersion` on rotation. Rejects any private key fields. |
-| `GET` | `/api/keys/:userId` | Bearer | Returns `{ userId, username, encryptionPublicKey, signingPublicKey, fingerprint, keyVersion }`. |
-
-### Conversation Routes (`/api/conversations`)
-
-| Method | Endpoint | Auth | Description |
-| :--- | :--- | :--- | :--- |
-| `POST` | `/api/conversations` | Bearer | Body `{ recipientId }`. Creates or retrieves atomic 1-to-1 conversation. |
-| `GET` | `/api/conversations` | Bearer | Returns user's conversations with peer metadata, latest encrypted message envelope, and unread count. |
-
-### Encrypted Message Routes (`/api/messages`)
-
-| Method | Endpoint | Auth | Description |
-| :--- | :--- | :--- | :--- |
-| `GET` | `/api/messages/:conversationId` | Bearer | Verifies conversation membership (`403` otherwise); returns ordered encrypted envelopes. |
-| `POST` | `/api/messages` | Bearer | Verifies membership & unique `messageId`; rejects plaintext (`400`); persists ciphertext + signature; emits Socket.IO `message:new`. |
-| `PATCH` | `/api/messages/:id/read` | Bearer | Verifies `req.user.id === message.recipientId` (`403` otherwise); updates `readAt` and emits `message:read`. |
-
-### Security Audit Routes (`/api/security`)
-
-| Method | Endpoint | Auth | Description |
-| :--- | :--- | :--- | :--- |
-| `GET` | `/api/security/logs` | Bearer | Returns latest 50 `SecurityLog` events for the authenticated user. |
-| `POST` | `/api/security/signature-warning` | Bearer | Records client-detected Ed25519 signature verification failures in `SecurityLog`. |
-
----
-
-## 3. Socket.IO Real-Time Events
-
-Socket handshake requires `auth: { token: "<jwt>" }`. Unauthenticated connections or revoked tokens are rejected immediately.
-
-| Event | Direction | Payload | Server Verification & Behavior |
-| :--- | :--- | :--- | :--- |
-| `user:online` | Server -> Clients | `{ userId, username, isOnline: true, lastSeen }` | Emitted when a user opens their first active socket. |
-| `user:offline` | Server -> Clients | `{ userId, username, isOnline: false, lastSeen }` | Emitted when a user closes their last active socket. |
-| `conversation:join` | Client -> Server | `{ conversationId }` | Verifies user is a participant in `conversationId` before joining room `conv:<id>`. |
-| `message:send` | Client -> Server | Encrypted envelope (`messageId`, `ciphertext`, `nonce`, `ephemeralPublicKey`, `signature`, ...) | Validates Zod schema, membership, and uniqueness; persists to MongoDB; emits `message:new` & `message:delivered`. |
-| `message:new` | Server -> Recipient | Serialized encrypted envelope | Delivered to `user:<recipientId>` and `conv:<conversationId>`. |
-| `message:delivered` | Bidirectional | `{ id, messageId, conversationId, deliveredAt }` | Confirms receipt by recipient's socket; updates MongoDB `deliveredAt`. |
-| `message:read` | Bidirectional | `{ messageId }` / `{ id, messageId, conversationId, deliveredAt, readAt }` | Verifies `socket.data.userId === message.recipientId` before updating `readAt`. |
+- Handshake requires valid, non-revoked JWT via `auth.token` or `Authorization: Bearer`.
+- Client -> Server: `conversation:join`, `conversation:leave`, `message:send`, `message:delivered`, `message:read`.
+- Server -> Client: `user:online`, `user:offline`, `message:new`, `message:delivered`, `message:read`.

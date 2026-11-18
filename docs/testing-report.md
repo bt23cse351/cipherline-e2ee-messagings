@@ -1,32 +1,17 @@
-# Testing & Verification Report
+# Security & Integration Testing Report
 
-## 1. Execution Command & Environment
+Automated test suite: `tests/e2ee.integration.test.ts` (`npm run test:security`).
 
-- **Command Executed:** `npm run test:security` (`tsx tests/e2ee.integration.test.ts`)
-- **Runtime:** Node.js `v22.23.2`, MongoDB (WiredTiger persistent test instance via `mongodb-memory-server`), Express + Socket.IO + `libsodium-wrappers` + Web Crypto API.
-- **Result Summary:** **11 / 11 automated integration & security test suites PASSED** (exit code `0`).
+## Test Cases Covered
 
----
-
-## 2. Executed Test Cases & Observed Results
-
-| Category | Test Case | Verification Method | Result |
-| :--- | :--- | :--- | :--- |
-| **Authentication** | Register accounts (`alice_test`, `bob_test`, `mallory_test`) | Verified HTTP `201`, JWT issuance, and `$argon2id$` PHC hash stored in MongoDB `User` | **PASS** |
-| **Authentication** | Reject duplicate accounts | Submitted duplicate username to `/api/auth/register`; verified HTTP `409` | **PASS** |
-| **Authentication** | Login with valid credentials | Submitted valid credentials to `/api/auth/login`; verified HTTP `200` + JWT | **PASS** |
-| **Authentication** | Reject wrong password | Submitted wrong password; verified HTTP `401` and generic `"Invalid credentials"` | **PASS** |
-| **Authentication** | Reject expired, invalid, and revoked JWTs | Tested expired JWT, malformed JWT, and JWT after `POST /api/auth/logout`; all rejected with `401` | **PASS** |
-| **Cryptography** | X25519 + HKDF-SHA256 key compatibility | Derived shared secret & HKDF-SHA256 key independently on Alice & Bob; verified byte-for-byte equality | **PASS** |
-| **Encryption** | Client-side E2EE & zero plaintext in DB | Encrypted `"Confidential BTech CSE E2EE Viva Message #42!"`, queried raw MongoDB `Message`, confirmed plaintext absent, decrypted on Bob | **PASS** |
-| **Signatures** | Reject modified ciphertext, modified signature, wrong sender | Mutated ciphertext byte, mutated signature byte, and substituted Mallory's Ed25519 key; all failed signature verification before decryption | **PASS** |
-| **Authorization** | Reject unauthorized read, send, read receipt, plaintext, and private key | Mallory blocked (`403`) on `GET /api/messages/:id`, `POST /api/messages`, Socket room join; Alice blocked (`403`) on self-read-receipt; plaintext & private keys rejected (`400`) | **PASS** |
-| **Realtime** | Socket.IO auth, live delivery, read receipts, reconnection | Rejected unauthenticated socket; verified live `message:new`, `message:read` delivery, and disconnect/reconnect | **PASS** |
-| **Database** | Indexes, safe logging, and persistence across restart | Verified unique indexes on `User`, `Message`; confirmed `SecurityLogs` contain zero plaintext/passwords/keys; stopped & restarted MongoDB using same WiredTiger `dbPath` and confirmed messages persisted | **PASS** |
-
----
-
-## 3. Build & Type Verification
-
-- `npm run build` (`vite build`): **PASS** — Compiled production client bundle cleanly.
-- `npm run lint` (`tsc --noEmit`): **PASS** — Zero TypeScript errors across frontend, backend, and tests.
+1. **User Registration & Client Key Bundle Verification**: Registers Alice, Bob, and Mallory with 32-byte X25519/Ed25519 public keys and verifies server fingerprint matching.
+2. **Argon2id Credential Storage**: Inspects MongoDB `User` document to verify `$argon2id$` hash and absence of plaintext password.
+3. **Generic Authentication Errors**: Verifies wrong passwords return HTTP `401` with generic `"Invalid credentials"`.
+4. **Private Key Leakage Prevention**: Verifies `POST /api/keys/publish` rejects payloads containing `encryptionPrivateKey`.
+5. **1-to-1 Conversation Initialization**: Verifies deterministic unique conversation pair creation.
+6. **Plaintext Rejection**: Verifies `POST /api/messages` rejects payloads containing `plaintext` or `text`.
+7. **Zero-Plaintext DB Persistence**: Encrypts & signs client-side, persists via REST, and asserts MongoDB record contains zero plaintext substring.
+8. **Verify-Then-Decrypt Round Trip**: Bob verifies Ed25519 signature and decrypts ciphertext back to original UTF-8 text.
+9. **Tamper & Forged Signature Rejection**: Mutates signature bytes and flips ciphertext bit; verifies decryption throws `SIGNATURE_INVALID` and AEAD tag failure respectively.
+10. **Authorization & JWT Revocation**: Blocks Mallory (`403 Forbidden`) from reading Alice–Bob messages and confirms `POST /api/auth/logout` revokes Alice's JWT (`401`).
+11. **Real-Time Socket.IO E2EE Delivery**: Connects Alice and Bob over authenticated WebSockets, sends encrypted envelope via `message:send`, and verifies real-time `message:new` decryption on Bob's socket.

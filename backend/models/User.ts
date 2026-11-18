@@ -24,7 +24,6 @@ const userSchema = new Schema<IUser>(
       lowercase: true,
       minlength: 3,
       maxlength: 24,
-      match: /^[a-z0-9_]+$/,
     },
     email: {
       type: String,
@@ -50,7 +49,6 @@ const userSchema = new Schema<IUser>(
     fingerprint: {
       type: String,
       default: '',
-      index: true,
     },
     keyVersion: {
       type: Number,
@@ -72,5 +70,4 @@ const userSchema = new Schema<IUser>(
 );
 
 export const User =
-  (mongoose.models.User as mongoose.Model<IUser>) ||
-  mongoose.model<IUser>('User', userSchema);
+  (mongoose.models.User as mongoose.Model<IUser>) || mongoose.model<IUser>('User', userSchema);

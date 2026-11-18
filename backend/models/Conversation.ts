@@ -33,7 +33,6 @@ const conversationSchema = new Schema<IConversation>(
 );
 
 conversationSchema.index({ participants: 1 });
-conversationSchema.index({ updatedAt: -1 });
 
 export const Conversation =
   (mongoose.models.Conversation as mongoose.Model<IConversation>) ||

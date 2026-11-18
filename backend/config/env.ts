@@ -9,8 +9,6 @@ const isPlaceholderSecret =
   rawSecret.includes('REPLACE_WITH') ||
   rawSecret.length < 32;
 
-// Ephemeral CSPRNG fallback for sandbox/demo environments when JWT_SECRET is not configured.
-// In production or persistent deployments, JWT_SECRET must be set via environment variables.
 const runtimeSecret = isPlaceholderSecret
   ? crypto.randomBytes(48).toString('hex')
   : rawSecret;

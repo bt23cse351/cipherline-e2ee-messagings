@@ -1,8 +1,9 @@
 import type {
   ConversationSummary,
   EncryptedMessageEnvelope,
-  PublicUser,
-  SecurityLogItem,
+  PublicKeyBundle,
+  SecurityLogEntry,
+  UserProfile,
 } from '../types/messaging';
 
 export class ApiError extends Error {
@@ -15,29 +16,44 @@ export class ApiError extends Error {
 
 async function request<T>(
   path: string,
-  options: RequestInit = {},
-  token?: string | null
+  options: {
+    method?: string;
+    token?: string | null;
+    body?: unknown;
+  } = {}
 ): Promise<T> {
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    ...((options.headers as Record<string, string>) || {}),
-  };
-
-  if (token) {
-    headers.Authorization = `Bearer ${token}`;
+  const headers: Record<string, string> = {};
+  if (options.body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+  }
+  if (options.token) {
+    headers.Authorization = `Bearer ${options.token}`;
   }
 
-  const response = await fetch(path, {
-    ...options,
+  const res = await fetch(path, {
+    method: options.method || 'GET',
     headers,
+    body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
   });
 
-  const data = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new ApiError(data.error || `Request failed (${response.status})`, response.status);
+  const contentType = res.headers.get('content-type') || '';
+  const data = contentType.includes('application/json') ? await res.json() : null;
+
+  if (!res.ok) {
+    throw new ApiError(
+      (data && typeof data.error === 'string' && data.error) ||
+        `Request failed with status ${res.status}`,
+      res.status
+    );
   }
 
   return data as T;
+}
+
+export interface AuthResponse {
+  token: string;
+  expiresAt: string;
+  user: UserProfile;
 }
 
 export const api = {
@@ -48,45 +64,38 @@ export const api = {
     encryptionPublicKey?: string;
     signingPublicKey?: string;
     fingerprint?: string;
-  }) {
-    return request<{ token: string; expiresAt: string; user: PublicUser }>(
-      '/api/auth/register',
-      {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      }
-    );
+  }): Promise<AuthResponse> {
+    return request<AuthResponse>('/api/auth/register', {
+      method: 'POST',
+      body: payload,
+    });
   },
 
-  login(payload: { identifier: string; password: string }) {
-    return request<{ token: string; expiresAt: string; user: PublicUser }>(
-      '/api/auth/login',
-      {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      }
-    );
+  login(payload: { identifier: string; password: string }): Promise<AuthResponse> {
+    return request<AuthResponse>('/api/auth/login', {
+      method: 'POST',
+      body: payload,
+    });
   },
 
-  logout(token: string) {
-    return request<{ message: string }>(
-      '/api/auth/logout',
-      { method: 'POST' },
-      token
-    );
+  logout(token: string): Promise<{ message: string }> {
+    return request<{ message: string }>('/api/auth/logout', {
+      method: 'POST',
+      token,
+    });
   },
 
-  getMe(token: string) {
-    return request<{ user: PublicUser }>('/api/auth/me', {}, token);
+  getMe(token: string): Promise<{ user: UserProfile }> {
+    return request<{ user: UserProfile }>('/api/auth/me', { token });
   },
 
-  searchUsers(token: string, search = '') {
-    const qs = search.trim() ? `?search=${encodeURIComponent(search.trim())}` : '';
-    return request<{ users: PublicUser[] }>(`/api/users${qs}`, {}, token);
+  listUsers(token: string, search = ''): Promise<{ users: UserProfile[] }> {
+    const query = search.trim() ? `?search=${encodeURIComponent(search.trim())}` : '';
+    return request<{ users: UserProfile[] }>(`/api/users${query}`, { token });
   },
 
-  getUserById(token: string, id: string) {
-    return request<{ user: PublicUser }>(`/api/users/${id}`, {}, token);
+  getUserById(token: string, userId: string): Promise<{ user: UserProfile }> {
+    return request<{ user: UserProfile }>(`/api/users/${encodeURIComponent(userId)}`, { token });
   },
 
   publishKeys(
@@ -96,99 +105,79 @@ export const api = {
       signingPublicKey: string;
       fingerprint: string;
     }
-  ) {
-    return request<{
-      userId: string;
-      username: string;
-      encryptionPublicKey: string;
-      signingPublicKey: string;
-      fingerprint: string;
-      keyVersion: number;
-    }>(
-      '/api/keys/publish',
-      {
-        method: 'POST',
-        body: JSON.stringify(payload),
-      },
-      token
-    );
+  ): Promise<PublicKeyBundle> {
+    return request<PublicKeyBundle>('/api/keys/publish', {
+      method: 'POST',
+      token,
+      body: payload,
+    });
   },
 
-  getUserKeys(token: string, userId: string) {
-    return request<{
-      userId: string;
-      username: string;
-      encryptionPublicKey: string;
-      signingPublicKey: string;
-      fingerprint: string;
-      keyVersion: number;
-    }>(`/api/keys/${userId}`, {}, token);
+  getUserKeys(token: string, userId: string): Promise<PublicKeyBundle> {
+    return request<PublicKeyBundle>(`/api/keys/${encodeURIComponent(userId)}`, { token });
   },
 
-  createOrGetConversation(token: string, recipientId: string) {
-    return request<{ conversation: ConversationSummary }>(
-      '/api/conversations',
-      {
-        method: 'POST',
-        body: JSON.stringify({ recipientId }),
-      },
-      token
-    );
+  listConversations(token: string): Promise<{ conversations: ConversationSummary[] }> {
+    return request<{ conversations: ConversationSummary[] }>('/api/conversations', { token });
   },
 
-  listConversations(token: string) {
-    return request<{ conversations: ConversationSummary[] }>(
-      '/api/conversations',
-      {},
-      token
-    );
+  createOrGetConversation(
+    token: string,
+    recipientId: string
+  ): Promise<{ conversation: ConversationSummary }> {
+    return request<{ conversation: ConversationSummary }>('/api/conversations', {
+      method: 'POST',
+      token,
+      body: { recipientId },
+    });
   },
 
-  getMessages(token: string, conversationId: string) {
+  getMessages(
+    token: string,
+    conversationId: string
+  ): Promise<{ messages: EncryptedMessageEnvelope[] }> {
     return request<{ messages: EncryptedMessageEnvelope[] }>(
-      `/api/messages/${conversationId}`,
-      {},
-      token
+      `/api/messages/${encodeURIComponent(conversationId)}`,
+      { token }
     );
   },
 
-  sendMessageRest(token: string, envelope: EncryptedMessageEnvelope) {
-    return request<{ message: EncryptedMessageEnvelope }>(
-      '/api/messages',
-      {
-        method: 'POST',
-        body: JSON.stringify(envelope),
-      },
-      token
-    );
+  sendMessage(
+    token: string,
+    envelope: EncryptedMessageEnvelope
+  ): Promise<{ message: EncryptedMessageEnvelope }> {
+    return request<{ message: EncryptedMessageEnvelope }>('/api/messages', {
+      method: 'POST',
+      token,
+      body: envelope,
+    });
   },
 
-  markMessageRead(token: string, idOrMessageId: string) {
-    return request<{
-      id: string;
-      messageId: string;
-      conversationId: string;
-      deliveredAt: string;
-      readAt: string;
-    }>(
-      `/api/messages/${idOrMessageId}/read`,
-      { method: 'PATCH' },
-      token
-    );
+  markMessageRead(
+    token: string,
+    id: string
+  ): Promise<{
+    id: string;
+    messageId: string;
+    conversationId: string;
+    deliveredAt: string;
+    readAt: string;
+  }> {
+    return request(`/api/messages/${encodeURIComponent(id)}/read`, {
+      method: 'PATCH',
+      token,
+    });
   },
 
-  getSecurityLogs(token: string) {
-    return request<{ logs: SecurityLogItem[] }>('/api/security/logs', {}, token);
+  getSecurityLogs(token: string): Promise<{ logs: SecurityLogEntry[] }> {
+    return request<{ logs: SecurityLogEntry[] }>('/api/security/logs', { token });
   },
 
-  reportSignatureWarning(token: string, messageId: string) {
-    return request<{ recorded: boolean }>(
-      '/api/security/signature-warning',
-      {
-        method: 'POST',
-        body: JSON.stringify({ messageId }),
-      },
-      token
-    );
+  reportSignatureWarning(token: string, messageId: string): Promise<{ recorded: boolean }> {
+    return request<{ recorded: boolean }>('/api/security/signature-warning', {
+      method: 'POST',
+      token,
+      body: { messageId },
+    });
   },
 };

@@ -1,39 +1,28 @@
-import { Lock } from 'lucide-react';
-import { VaultUnlockModal } from './components/VaultUnlockModal';
 import { AuthProvider, useAuth } from './context/AuthContext';
 import { AuthPages } from './pages/AuthPages';
 import { Dashboard } from './pages/Dashboard';
 
-function AppContent() {
-  const { user, initializing } = useAuth();
+function AppShell() {
+  const { user, loading } = useAuth();
 
-  if (initializing) {
+  if (loading) {
     return (
-      <div className="min-h-screen bg-slate-50 flex flex-col items-center justify-center gap-3 text-slate-600">
-        <div className="h-10 w-10 rounded-xl bg-teal-700 text-white flex items-center justify-center">
-          <Lock className="h-5 w-5" />
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-6">
+        <div className="text-center space-y-2">
+          <p className="text-base font-display font-semibold text-slate-900">CipherLine</p>
+          <p className="text-xs text-slate-500">Verifying encrypted session...</p>
         </div>
-        <p className="text-xs font-medium">Restoring encrypted session...</p>
       </div>
     );
   }
 
-  if (!user) {
-    return <AuthPages />;
-  }
-
-  return (
-    <>
-      <Dashboard />
-      <VaultUnlockModal />
-    </>
-  );
+  return user ? <Dashboard /> : <AuthPages />;
 }
 
 export default function App() {
   return (
     <AuthProvider>
-      <AppContent />
+      <AppShell />
     </AuthProvider>
   );
 }

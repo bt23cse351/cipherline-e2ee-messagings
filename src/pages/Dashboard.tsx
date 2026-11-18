@@ -1,405 +1,358 @@
-import { useCallback, useEffect, useState } from 'react';
-import {
-  Lock,
-  LogOut,
-  MessageSquare,
-  ShieldCheck,
-  User,
-  Users,
-} from 'lucide-react';
-import { Avatar } from '../components/Avatar';
+import { Lock, LogOut, Unlock } from 'lucide-react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { Socket } from 'socket.io-client';
 import { ChatWindow } from '../components/ChatWindow';
 import { ConversationList } from '../components/ConversationList';
 import { UserDirectory } from '../components/UserDirectory';
+import { VaultUnlockModal } from '../components/VaultUnlockModal';
 import { useAuth } from '../context/AuthContext';
 import { api } from '../services/api';
+import { createChatSocket } from '../services/socket';
 import type {
   ConversationSummary,
   EncryptedMessageEnvelope,
-  PublicUser,
+  UserProfile,
 } from '../types/messaging';
 import { ProfileView } from './ProfileView';
 import { SecurityDetailsView } from './SecurityDetailsView';
 
-type ActiveTab = 'chats' | 'people' | 'security' | 'profile';
+type ActiveView = 'messages' | 'directory' | 'security' | 'profile';
 
 export function Dashboard() {
-  const { user, token, socket, socketConnected, logout } = useAuth();
-  const [activeTab, setActiveTab] = useState<ActiveTab>('chats');
+  const {
+    user,
+    token,
+    identityKeys,
+    needsVaultUnlock,
+    verifiedContacts,
+    logoutAccount,
+    lockVault,
+  } = useAuth();
+
+  const [activeView, setActiveView] = useState<ActiveView>('messages');
   const [conversations, setConversations] = useState<ConversationSummary[]>([]);
-  const [selectedConversationId, setSelectedConversationId] = useState<string | null>(null);
-  const [loadingConvs, setLoadingConvs] = useState(true);
-  const [incomingBuffer, setIncomingBuffer] = useState<EncryptedMessageEnvelope[]>([]);
-  const [securityContact, setSecurityContact] = useState<PublicUser | null>(null);
+  const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
+  const [loadingConversations, setLoadingConversations] = useState(true);
+
+  const [directoryUsers, setDirectoryUsers] = useState<UserProfile[]>([]);
+  const [directorySearch, setDirectorySearch] = useState('');
+  const [loadingDirectory, setLoadingDirectory] = useState(false);
+
+  const [showVaultModal, setShowVaultModal] = useState(false);
+  const [socketConnected, setSocketConnected] = useState(false);
+  const socketRef = useRef<Socket | null>(null);
+  const [socketInstance, setSocketInstance] = useState<Socket | null>(null);
 
   const fetchConversations = useCallback(async () => {
     if (!token) return;
     try {
-      const res = await api.listConversations(token);
-      setConversations(res.conversations);
-    } catch {
-      // Keep current state on transient errors
+      const { conversations: list } = await api.listConversations(token);
+      const validList = list.filter((c) => Boolean(c && c.id && c.peer?.id));
+      setConversations(validList);
+      setActiveConversationId((prev) => prev || validList[0]?.id || null);
     } finally {
-      setLoadingConvs(false);
+      setLoadingConversations(false);
     }
   }, [token]);
 
-  useEffect(() => {
-    fetchConversations();
-  }, [fetchConversations]);
+  const fetchDirectory = useCallback(
+    async (search = '') => {
+      if (!token) return;
+      setLoadingDirectory(true);
+      try {
+        const { users } = await api.listUsers(token, search);
+        setDirectoryUsers(users);
+      } finally {
+        setLoadingDirectory(false);
+      }
+    },
+    [token]
+  );
 
-  // Real-time Socket.IO event listeners
   useEffect(() => {
-    if (!socket) return;
+    void fetchConversations();
+    void fetchDirectory('');
+  }, [fetchConversations, fetchDirectory]);
 
-    const handlePresence = (payload: {
-      userId: string;
-      isOnline: boolean;
-      lastSeen: string;
-    }) => {
+  useEffect(() => {
+    if (!token) return;
+    const socket = createChatSocket(token);
+    socketRef.current = socket;
+    setSocketInstance(socket);
+
+    socket.on('connect', () => {
+      setSocketConnected(true);
+    });
+    socket.on('disconnect', () => {
+      setSocketConnected(false);
+    });
+
+    socket.on('user:online', (evt: { userId: string; lastSeen: string }) => {
+      setDirectoryUsers((prev) =>
+        prev.map((u) => (u.id === evt.userId ? { ...u, isOnline: true, lastSeen: evt.lastSeen } : u))
+      );
       setConversations((prev) =>
-        prev.map((conv) =>
-          conv.peer?.id === payload.userId
-            ? {
-                ...conv,
-                peer: {
-                  ...conv.peer,
-                  isOnline: payload.isOnline,
-                  lastSeen: payload.lastSeen,
-                },
-              }
-            : conv
+        prev.map((c) =>
+          c.peer?.id === evt.userId
+            ? { ...c, peer: { ...c.peer, isOnline: true, lastSeen: evt.lastSeen } }
+            : c
         )
       );
-    };
+    });
 
-    const handleNewMessage = (envelope: EncryptedMessageEnvelope) => {
-      setIncomingBuffer((prev) => {
-        if (prev.some((m) => m.messageId === envelope.messageId)) {
-          return prev;
-        }
-        return [...prev.slice(-150), envelope];
-      });
+    socket.on('user:offline', (evt: { userId: string; lastSeen: string }) => {
+      setDirectoryUsers((prev) =>
+        prev.map((u) =>
+          u.id === evt.userId ? { ...u, isOnline: false, lastSeen: evt.lastSeen } : u
+        )
+      );
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.peer?.id === evt.userId
+            ? { ...c, peer: { ...c.peer, isOnline: false, lastSeen: evt.lastSeen } }
+            : c
+        )
+      );
+    });
 
-      if (envelope.senderId !== user?.id) {
-        socket.emit('message:delivered', { messageId: envelope.messageId });
-      }
-
+    socket.on('message:new', (envelope: EncryptedMessageEnvelope) => {
       setConversations((prev) => {
         const exists = prev.some((c) => c.id === envelope.conversationId);
         if (!exists) {
-          fetchConversations();
+          void fetchConversations();
           return prev;
         }
-        return prev
-          .map((c) => {
-            if (c.id !== envelope.conversationId) return c;
-            const isOpen = selectedConversationId === c.id && activeTab === 'chats';
-            const incrementUnread =
-              envelope.recipientId === user?.id && !isOpen ? 1 : 0;
-            return {
-              ...c,
-              lastMessage: envelope,
-              lastMessageAt: envelope.clientTimestamp,
-              updatedAt: envelope.clientTimestamp,
-              unreadCount: isOpen ? 0 : c.unreadCount + incrementUnread,
-            };
-          })
-          .sort(
-            (a, b) =>
-              new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
-          );
+        const updated = prev.map((c) => {
+          if (c.id !== envelope.conversationId) return c;
+          const isIncoming = user ? envelope.recipientId === user.id : false;
+          const isCurrentlyOpen = activeConversationId === envelope.conversationId;
+          return {
+            ...c,
+            lastMessage: envelope,
+            lastMessageAt: envelope.clientTimestamp,
+            updatedAt: new Date().toISOString(),
+            unreadCount:
+              isIncoming && !isCurrentlyOpen ? (c.unreadCount || 0) + 1 : c.unreadCount,
+          };
+        });
+        return updated.sort(
+          (a, b) =>
+            Date.parse(b.lastMessageAt || b.updatedAt) -
+            Date.parse(a.lastMessageAt || a.updatedAt)
+        );
       });
-    };
-
-    const handleDelivered = (payload: {
-      messageId: string;
-      conversationId: string;
-      deliveredAt: string;
-    }) => {
-      setIncomingBuffer((prev) =>
-        prev.map((m) =>
-          m.messageId === payload.messageId
-            ? { ...m, deliveredAt: payload.deliveredAt }
-            : m
-        )
-      );
-    };
-
-    const handleRead = (payload: {
-      messageId: string;
-      conversationId: string;
-      deliveredAt: string;
-      readAt: string;
-    }) => {
-      setIncomingBuffer((prev) =>
-        prev.map((m) =>
-          m.messageId === payload.messageId
-            ? { ...m, deliveredAt: payload.deliveredAt, readAt: payload.readAt }
-            : m
-        )
-      );
-    };
-
-    const handleReconnect = () => {
-      fetchConversations();
-      if (selectedConversationId) {
-        socket.emit('conversation:join', { conversationId: selectedConversationId });
-      }
-    };
-
-    socket.on('user:online', handlePresence);
-    socket.on('user:offline', handlePresence);
-    socket.on('message:new', handleNewMessage);
-    socket.on('message:delivered', handleDelivered);
-    socket.on('message:read', handleRead);
-    socket.on('connect', handleReconnect);
+    });
 
     return () => {
-      socket.off('user:online', handlePresence);
-      socket.off('user:offline', handlePresence);
-      socket.off('message:new', handleNewMessage);
-      socket.off('message:delivered', handleDelivered);
-      socket.off('message:read', handleRead);
-      socket.off('connect', handleReconnect);
+      socket.disconnect();
+      socketRef.current = null;
+      setSocketInstance(null);
+      setSocketConnected(false);
     };
-  }, [activeTab, fetchConversations, selectedConversationId, socket, user?.id]);
+  }, [token, user, activeConversationId, fetchConversations]);
 
-  const handleSelectConversation = (conv: ConversationSummary) => {
-    setSelectedConversationId(conv.id);
-    setActiveTab('chats');
+  const handleSearchDirectory = useCallback(
+    (query: string) => {
+      setDirectorySearch(query);
+      void fetchDirectory(query);
+    },
+    [fetchDirectory]
+  );
+
+  const handleStartChat = useCallback(
+    async (targetUser: UserProfile) => {
+      if (!token) return;
+      const { conversation } = await api.createOrGetConversation(token, targetUser.id);
+      if (!conversation?.peer?.id) return;
+
+      setConversations((prev) => {
+        const filtered = prev.filter((c) => c.id !== conversation.id);
+        return [conversation, ...filtered];
+      });
+      setActiveConversationId(conversation.id);
+      setActiveView('messages');
+    },
+    [token]
+  );
+
+  const handleSelectConversation = useCallback((conversationId: string) => {
+    setActiveConversationId(conversationId);
+    setActiveView('messages');
     setConversations((prev) =>
-      prev.map((c) => (c.id === conv.id ? { ...c, unreadCount: 0 } : c))
+      prev.map((c) => (c.id === conversationId ? { ...c, unreadCount: 0 } : c))
     );
-  };
+  }, []);
 
-  const handleStartConversation = async (peer: PublicUser) => {
-    if (!token) return;
-    const res = await api.createOrGetConversation(token, peer.id);
-    const conv = res.conversation;
-    setConversations((prev) => {
-      const exists = prev.some((c) => c.id === conv.id);
-      return exists ? prev : [conv, ...prev];
-    });
-    setSelectedConversationId(conv.id);
-    setActiveTab('chats');
-  };
-
-  const handleInspectSecurity = (peer: PublicUser) => {
-    setSecurityContact(peer);
-    setActiveTab('security');
-  };
-
-  const handleMessageSentOrReceived = (msg: EncryptedMessageEnvelope) => {
-    setConversations((prev) =>
-      prev
-        .map((c) =>
-          c.id === msg.conversationId
+  const handleConversationActivity = useCallback(
+    (conversationId: string, envelope: EncryptedMessageEnvelope) => {
+      setConversations((prev) => {
+        const updated = prev.map((c) =>
+          c.id === conversationId
             ? {
                 ...c,
-                lastMessage: msg,
-                lastMessageAt: msg.clientTimestamp,
-                updatedAt: msg.clientTimestamp,
+                lastMessage: envelope,
+                lastMessageAt: envelope.clientTimestamp,
+                updatedAt: new Date().toISOString(),
               }
             : c
-        )
-        .sort(
+        );
+        return updated.sort(
           (a, b) =>
-            new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
-        )
-    );
-  };
+            Date.parse(b.lastMessageAt || b.updatedAt) -
+            Date.parse(a.lastMessageAt || a.updatedAt)
+        );
+      });
+    },
+    []
+  );
 
-  const selectedConversation =
-    conversations.find((c) => c.id === selectedConversationId) || null;
-
-  const navItems: Array<{ id: ActiveTab; label: string; icon: typeof MessageSquare }> = [
-    { id: 'chats', label: 'Chats', icon: MessageSquare },
-    { id: 'people', label: 'People', icon: Users },
-    { id: 'security', label: 'Security', icon: ShieldCheck },
-    { id: 'profile', label: 'Profile', icon: User },
-  ];
+  const activeConversation = conversations.find((c) => c.id === activeConversationId) || null;
 
   return (
-    <div className="h-screen w-screen overflow-hidden flex flex-col md:flex-row bg-slate-100">
-      {/* Desktop Left Navigation Rail */}
-      <aside className="hidden md:flex w-18 bg-slate-900 text-slate-300 flex-col items-center justify-between py-4 border-r border-slate-800 shrink-0">
-        <div className="flex flex-col items-center gap-6">
-          <div
-            className="h-10 w-10 rounded-xl bg-teal-700 text-white flex items-center justify-center"
-            title="CipherLine E2EE"
-          >
-            <Lock className="h-5 w-5" />
-          </div>
+    <div className="h-screen flex flex-col bg-slate-50 overflow-hidden">
+      <header className="px-5 py-3 bg-white border-b border-slate-200 flex items-center justify-between gap-8 shrink-0">
+        <span className="text-base font-display font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0">
+          CipherLine
+        </span>
 
-          <nav className="flex flex-col items-center gap-2" aria-label="Primary navigation">
-            {navItems.map((item) => {
-              const Icon = item.icon;
-              const isActive = activeTab === item.id;
-              return (
-                <button
-                  key={item.id}
-                  type="button"
-                  onClick={() => setActiveTab(item.id)}
-                  className={`w-12 py-2 rounded-xl flex flex-col items-center gap-1 transition-colors ${
-                    isActive
-                      ? 'bg-slate-800 text-teal-400'
-                      : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
-                  }`}
-                  title={item.label}
-                >
-                  <Icon className="h-4 w-4" />
-                  <span className="text-[10px] font-medium">{item.label}</span>
-                </button>
-              );
-            })}
-          </nav>
-        </div>
+        <nav className="flex items-center gap-6 overflow-x-auto text-xs font-medium">
+          {(
+            [
+              { id: 'messages', label: 'Messages' },
+              { id: 'directory', label: 'Directory' },
+              { id: 'security', label: 'Security' },
+              { id: 'profile', label: 'Keys & Profile' },
+            ] as const
+          ).map((tab) => (
+            <button
+              key={tab.id}
+              type="button"
+              onClick={() => {
+                setActiveView(tab.id);
+                if (tab.id === 'directory') {
+                  void fetchDirectory(directorySearch);
+                }
+              }}
+              className={`py-1.5 border-b-2 transition-colors whitespace-nowrap shrink-0 ${
+                activeView === tab.id
+                  ? 'border-teal-700 text-slate-900 font-semibold'
+                  : 'border-transparent text-slate-600 hover:text-slate-900'
+              }`}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </nav>
 
-        <div className="flex flex-col items-center gap-3">
-          {user && (
+        <div className="flex items-center gap-3 shrink-0">
+          <span className="hidden md:inline text-xs text-slate-500 whitespace-nowrap">
+            @{user?.username} · {socketConnected ? 'Connected' : 'Reconnecting'}
+          </span>
+          {identityKeys ? (
             <button
               type="button"
-              onClick={() => setActiveTab('profile')}
-              title={`@${user.username}`}
+              onClick={lockVault}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0"
             >
-              <Avatar
-                username={user.username}
-                isOnline={socketConnected}
-                showPresence
-                size="sm"
-              />
+              <Lock className="w-3.5 h-3.5" />
+              <span>Lock Vault</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setShowVaultModal(true)}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 whitespace-nowrap shrink-0"
+            >
+              <Unlock className="w-3.5 h-3.5" />
+              <span>Unlock Vault</span>
             </button>
           )}
           <button
             type="button"
-            onClick={logout}
-            className="p-2.5 text-slate-400 hover:text-red-400 hover:bg-slate-800 rounded-xl transition-colors"
-            title="Sign Out"
-            aria-label="Sign Out"
+            onClick={() => void logoutAccount()}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap shrink-0"
           >
-            <LogOut className="h-4 w-4" />
-          </button>
-        </div>
-      </aside>
-
-      {/* Mobile Top Bar */}
-      <header className="md:hidden bg-slate-900 text-white px-4 py-2.5 flex items-center justify-between shrink-0">
-        <div className="flex items-center gap-2">
-          <Lock className="h-4 w-4 text-teal-400" />
-          <span className="font-display text-sm font-semibold">CipherLine</span>
-        </div>
-        <div className="flex items-center gap-1">
-          {navItems.map((item) => {
-            const Icon = item.icon;
-            const isActive = activeTab === item.id;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => {
-                  setActiveTab(item.id);
-                  if (item.id === 'chats') setSelectedConversationId(null);
-                }}
-                className={`p-2 rounded-lg text-xs flex items-center gap-1 ${
-                  isActive ? 'bg-slate-800 text-teal-400' : 'text-slate-300'
-                }`}
-                aria-label={item.label}
-              >
-                <Icon className="h-4 w-4" />
-              </button>
-            );
-          })}
-          <button
-            type="button"
-            onClick={logout}
-            className="p-2 text-slate-300 hover:text-red-400"
-            aria-label="Sign Out"
-          >
-            <LogOut className="h-4 w-4" />
+            <LogOut className="w-3.5 h-3.5" />
+            <span>Sign Out</span>
           </button>
         </div>
       </header>
 
-      {/* Main Content Area */}
-      <main className="flex-1 flex min-h-0 overflow-hidden">
-        {activeTab === 'chats' && (
-          <>
-            <div
-              className={`${
-                selectedConversation ? 'hidden md:flex' : 'flex'
-              } w-full md:w-80 lg:w-96 flex-col shrink-0 h-full`}
-            >
-              <ConversationList
-                conversations={conversations}
-                selectedConversationId={selectedConversationId}
-                loading={loadingConvs}
-                onSelectConversation={handleSelectConversation}
-                onOpenDirectory={() => setActiveTab('people')}
-              />
-            </div>
+      <div className="flex-1 min-h-0 flex overflow-hidden">
+        <aside className="w-72 lg:w-80 border-r border-slate-200 bg-white shrink-0 hidden sm:flex flex-col">
+          <ConversationList
+            conversations={conversations}
+            activeConversationId={activeConversationId}
+            verifiedContacts={verifiedContacts}
+            loading={loadingConversations}
+            onSelectConversation={handleSelectConversation}
+            onOpenDirectory={() => setActiveView('directory')}
+          />
+        </aside>
 
-            <div
-              className={`${
-                selectedConversation ? 'flex' : 'hidden md:flex'
-              } flex-1 flex-col h-full min-w-0`}
-            >
-              {selectedConversation ? (
-                <ChatWindow
-                  conversation={selectedConversation}
-                  incomingMessages={incomingBuffer}
-                  onBackMobile={() => setSelectedConversationId(null)}
-                  onInspectPeerSecurity={handleInspectSecurity}
-                  onMessageSentOrReceived={handleMessageSentOrReceived}
-                />
-              ) : (
-                <div className="h-full flex items-center justify-center bg-slate-50 p-8 text-center">
-                  <div className="max-w-sm">
-                    <div className="mx-auto h-12 w-12 rounded-2xl bg-white border border-slate-200 text-teal-700 flex items-center justify-center shadow-xs">
-                      <Lock className="h-5 w-5" />
-                    </div>
-                    <h2 className="mt-4 font-display text-lg font-semibold text-slate-900">
-                      Select a conversation
+        <main className="flex-1 min-w-0 min-h-0">
+          {activeView === 'messages' ? (
+            activeConversation ? (
+              <ChatWindow
+                conversation={activeConversation}
+                socket={socketInstance}
+                onUnlockVaultClick={() => setShowVaultModal(true)}
+                onConversationActivity={handleConversationActivity}
+              />
+            ) : (
+              <>
+                <div className="h-full flex flex-col sm:hidden">
+                  <ConversationList
+                    conversations={conversations}
+                    activeConversationId={activeConversationId}
+                    verifiedContacts={verifiedContacts}
+                    loading={loadingConversations}
+                    onSelectConversation={handleSelectConversation}
+                    onOpenDirectory={() => setActiveView('directory')}
+                  />
+                </div>
+                <div className="hidden sm:flex h-full items-center justify-center p-8 bg-slate-50">
+                  <div className="max-w-md text-center space-y-3 bg-white border border-slate-200 rounded-xl p-8">
+                    <h2 className="text-base font-semibold text-slate-900">
+                      Select a Conversation or Start a New Chat
                     </h2>
-                    <p className="mt-1.5 text-xs text-slate-500 leading-relaxed">
-                      Choose an existing encrypted thread from the sidebar or open the User
-                      Directory to start a new 1-to-1 end-to-end encrypted chat.
+                    <p className="text-xs text-slate-600 leading-relaxed">
+                      Choose an existing encrypted thread from the sidebar or open the directory to
+                      pick another registered user.
                     </p>
                     <button
                       type="button"
-                      onClick={() => setActiveTab('people')}
-                      className="mt-5 px-4 py-2 bg-teal-700 hover:bg-teal-800 text-white text-xs font-medium rounded-lg transition-colors"
+                      onClick={() => setActiveView('directory')}
+                      className="px-4 py-2 text-xs font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 whitespace-nowrap"
                     >
-                      Find Registered Users
+                      Open User Directory
                     </button>
                   </div>
                 </div>
-              )}
-            </div>
-          </>
-        )}
-
-        {activeTab === 'people' && (
-          <div className="flex-1 h-full overflow-hidden">
+              </>
+            )
+          ) : activeView === 'directory' ? (
             <UserDirectory
-              onStartConversation={handleStartConversation}
-              onInspectContactSecurity={handleInspectSecurity}
+              users={directoryUsers}
+              loading={loadingDirectory}
+              verifiedContacts={verifiedContacts}
+              onSearchChange={handleSearchDirectory}
+              onStartChat={handleStartChat}
             />
-          </div>
-        )}
+          ) : activeView === 'security' ? (
+            <SecurityDetailsView />
+          ) : (
+            <ProfileView onOpenVaultModal={() => setShowVaultModal(true)} />
+          )}
+        </main>
+      </div>
 
-        {activeTab === 'security' && (
-          <div className="flex-1 h-full overflow-hidden">
-            <SecurityDetailsView initialContact={securityContact} />
-          </div>
-        )}
-
-        {activeTab === 'profile' && (
-          <div className="flex-1 h-full overflow-hidden">
-            <ProfileView />
-          </div>
-        )}
-      </main>
+      {(showVaultModal || needsVaultUnlock) && (
+        <VaultUnlockModal
+          allowDismiss={!needsVaultUnlock || showVaultModal}
+          onClose={() => setShowVaultModal(false)}
+        />
+      )}
     </div>
   );
 }

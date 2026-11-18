@@ -96,7 +96,6 @@ export async function sendMessage(req: AuthenticatedRequest, res: Response): Pro
     return;
   }
 
-  // Reject any accidental plaintext payload field
   if ('plaintext' in (req.body as Record<string, unknown>) || 'text' in (req.body as Record<string, unknown>)) {
     res.status(400).json({
       error: 'Plaintext messages are rejected. Encrypt payload client-side before sending.',

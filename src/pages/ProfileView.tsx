@@ -1,94 +1,210 @@
-import { Lock, LogOut, ShieldCheck, UserCheck } from 'lucide-react';
-import { Avatar } from '../components/Avatar';
+import { Check, Copy, KeyRound, Lock, RefreshCw, ShieldCheck } from 'lucide-react';
+import { useState } from 'react';
 import { useAuth } from '../context/AuthContext';
+import { formatFingerprint } from '../crypto/e2ee';
 
-export function ProfileView() {
-  const { user, vaultStatus, socketConnected, lockVaultMemory, logout } = useAuth();
+interface ProfileViewProps {
+  onOpenVaultModal: () => void;
+}
+
+export function ProfileView({ onOpenVaultModal }: ProfileViewProps) {
+  const { user, identityKeys, vaultExists, exportVaultBackup, lockVault } = useAuth();
+  const [copiedField, setCopiedField] = useState<string | null>(null);
+  const [backupPayload, setBackupPayload] = useState<string | null>(null);
+  const [backupError, setBackupError] = useState<string | null>(null);
 
   if (!user) return null;
 
+  async function copyText(field: string, value: string) {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopiedField(field);
+      setTimeout(() => setCopiedField(null), 1600);
+    } catch {
+      // Ignore clipboard failures
+    }
+  }
+
+  async function handleRevealBackup() {
+    setBackupError(null);
+    try {
+      const json = await exportVaultBackup();
+      setBackupPayload(json);
+    } catch (err) {
+      setBackupError(err instanceof Error ? err.message : 'Unable to export encrypted vault');
+    }
+  }
+
   return (
-    <div className="h-full overflow-y-auto bg-slate-50 p-5 sm:p-8">
-      <div className="max-w-2xl mx-auto space-y-6">
-        <div>
-          <h1 className="font-display text-2xl font-semibold text-slate-900">
-            Account Profile
-          </h1>
-          <p className="mt-1 text-sm text-slate-600">
-            Manage your active CipherLine identity, local key vault lock state, and session.
-          </p>
-        </div>
-
-        <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-6">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-100 pb-6">
-            <div className="flex items-center gap-4">
-              <Avatar username={user.username} isOnline={socketConnected} showPresence size="lg" />
-              <div>
-                <h2 className="font-display text-lg font-semibold text-slate-900">
-                  @{user.username}
-                </h2>
-                <p className="text-xs text-slate-500">{user.email}</p>
-              </div>
+    <div className="h-full overflow-y-auto bg-slate-50 p-6">
+      <div className="max-w-4xl mx-auto space-y-6">
+        <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-5">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-slate-200 pb-4">
+            <div>
+              <h1 className="text-lg font-semibold text-slate-900">
+                Identity Keys &amp; Local Vault
+              </h1>
+              <p className="text-xs text-slate-600 mt-0.5">
+                Signed in as @{user.username} ({user.email}) · Key Version v{user.keyVersion}
+              </p>
             </div>
-
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2.5 shrink-0">
+              {identityKeys ? (
+                <button
+                  type="button"
+                  onClick={lockVault}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 whitespace-nowrap"
+                >
+                  <Lock className="w-3.5 h-3.5" />
+                  <span>Lock Vault</span>
+                </button>
+              ) : null}
               <button
                 type="button"
-                onClick={lockVaultMemory}
-                className="px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors flex items-center gap-1.5"
+                onClick={onOpenVaultModal}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-medium text-white bg-teal-700 rounded-lg hover:bg-teal-800 whitespace-nowrap"
               >
-                <Lock className="h-3.5 w-3.5" />
-                <span>Lock Vault</span>
-              </button>
-              <button
-                type="button"
-                onClick={logout}
-                className="px-3.5 py-2 text-xs font-medium text-white bg-red-700 hover:bg-red-800 rounded-lg transition-colors flex items-center gap-1.5"
-              >
-                <LogOut className="h-3.5 w-3.5" />
-                <span>Sign Out</span>
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>{identityKeys ? 'Manage / Rotate Keys' : 'Unlock Vault'}</span>
               </button>
             </div>
           </div>
 
-          <dl className="grid grid-cols-1 sm:grid-cols-2 gap-5 text-xs">
-            <div>
-              <dt className="text-slate-500">User ID</dt>
-              <dd className="mt-1 font-mono text-slate-900 break-all">{user.id}</dd>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
+            <div className="p-4 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
+              <span className="text-slate-500">Local Key Vault Status</span>
+              <div className="flex items-center gap-1.5 font-semibold text-slate-900">
+                {identityKeys ? (
+                  <>
+                    <ShieldCheck className="w-4 h-4 text-emerald-700" />
+                    <span>Unlocked in Memory</span>
+                  </>
+                ) : vaultExists ? (
+                  <>
+                    <Lock className="w-4 h-4 text-amber-700" />
+                    <span>Encrypted on Device (Locked)</span>
+                  </>
+                ) : (
+                  <>
+                    <KeyRound className="w-4 h-4 text-rose-700" />
+                    <span>No Local Vault on This Browser</span>
+                  </>
+                )}
+              </div>
             </div>
-            <div>
-              <dt className="text-slate-500">Active Key Version</dt>
-              <dd className="mt-1 font-mono tabular-nums text-slate-900">
-                v{user.keyVersion} (X25519 + Ed25519)
-              </dd>
+            <div className="p-4 rounded-lg bg-slate-50 border border-slate-200 space-y-1">
+              <span className="text-slate-500">Private Key Exposure</span>
+              <p className="font-semibold text-slate-900">
+                Zero server transmission (PBKDF2 + AES-GCM local only)
+              </p>
             </div>
-            <div>
-              <dt className="text-slate-500">Local Key Vault Status</dt>
-              <dd className="mt-1 flex items-center gap-1.5 font-medium text-slate-900">
-                <ShieldCheck className="h-4 w-4 text-teal-700" />
-                <span>
-                  {vaultStatus === 'unlocked'
-                    ? 'Unlocked in memory'
-                    : vaultStatus === 'locked'
-                      ? 'Locked (AES-256-GCM)'
-                      : 'Missing on this browser'}
+          </div>
+
+          <div className="space-y-4">
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs font-medium text-slate-700">
+                  SHA-256 Public Key Fingerprint
                 </span>
-              </dd>
+                {user.fingerprint && (
+                  <button
+                    type="button"
+                    onClick={() => void copyText('fp', user.fingerprint)}
+                    className="inline-flex items-center gap-1 text-xs font-medium text-slate-500 hover:text-slate-900"
+                  >
+                    {copiedField === 'fp' ? (
+                      <>
+                        <Check className="w-3 h-3 text-emerald-700" />
+                        <span className="text-emerald-700">Copied</span>
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3 h-3" />
+                        <span>Copy Hex</span>
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
+              <p className="text-xs font-mono text-slate-900 bg-slate-50 border border-slate-200 rounded-lg p-3 break-all">
+                {formatFingerprint(user.fingerprint)}
+              </p>
             </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div className="space-y-1.5">
+                <span className="text-xs font-medium text-slate-700">
+                  X25519 Encryption Public Key (Base64)
+                </span>
+                <p className="text-xs font-mono text-slate-800 bg-slate-50 border border-slate-200 rounded-lg p-3 break-all">
+                  {user.encryptionPublicKey || 'Not published'}
+                </p>
+              </div>
+              <div className="space-y-1.5">
+                <span className="text-xs font-medium text-slate-700">
+                  Ed25519 Signing Public Key (Base64)
+                </span>
+                <p className="text-xs font-mono text-slate-800 bg-slate-50 border border-slate-200 rounded-lg p-3 break-all">
+                  {user.signingPublicKey || 'Not published'}
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="bg-white border border-slate-200 rounded-xl p-6 space-y-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
             <div>
-              <dt className="text-slate-500">Real-Time Socket State</dt>
-              <dd className="mt-1 flex items-center gap-1.5 font-medium text-slate-900">
-                <UserCheck className="h-4 w-4 text-teal-700" />
-                <span>{socketConnected ? 'Connected via Socket.IO' : 'Disconnected'}</span>
-              </dd>
+              <h2 className="text-base font-semibold text-slate-900">
+                Encrypted Vault Backup Payload
+              </h2>
+              <p className="text-xs text-slate-600 mt-0.5">
+                Copy this AES-256-GCM encrypted JSON envelope to restore your private keys on another
+                browser without exposing plaintext keys.
+              </p>
             </div>
-            <div className="sm:col-span-2">
-              <dt className="text-slate-500">Account Created</dt>
-              <dd className="mt-1 font-mono tabular-nums text-slate-900">
-                {user.createdAt ? new Date(user.createdAt).toLocaleString() : 'Active session'}
-              </dd>
+            <button
+              type="button"
+              onClick={() => void handleRevealBackup()}
+              disabled={!vaultExists}
+              className="px-3.5 py-2 text-xs font-medium text-slate-700 bg-white border border-slate-200 rounded-lg hover:bg-slate-50 disabled:opacity-50 whitespace-nowrap shrink-0"
+            >
+              Show Encrypted Backup JSON
+            </button>
+          </div>
+
+          {backupError && (
+            <p className="text-xs text-rose-700 bg-rose-50 border border-rose-200 rounded-lg p-3">
+              {backupError}
+            </p>
+          )}
+
+          {backupPayload && (
+            <div className="space-y-2">
+              <div className="flex justify-end">
+                <button
+                  type="button"
+                  onClick={() => void copyText('backup', backupPayload)}
+                  className="inline-flex items-center gap-1 text-xs font-medium text-teal-700 hover:text-teal-800"
+                >
+                  {copiedField === 'backup' ? (
+                    <>
+                      <Check className="w-3.5 h-3.5" />
+                      <span>Copied Encrypted JSON</span>
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="w-3.5 h-3.5" />
+                      <span>Copy Encrypted JSON</span>
+                    </>
+                  )}
+                </button>
+              </div>
+              <pre className="text-xs font-mono text-slate-800 bg-slate-50 border border-slate-200 rounded-lg p-3 max-h-48 overflow-y-auto break-all whitespace-pre-wrap">
+                {backupPayload}
+              </pre>
             </div>
-          </dl>
+          )}
         </div>
       </div>
     </div>

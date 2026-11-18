@@ -1,542 +1,436 @@
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
+import crypto from 'node:crypto';
 import http from 'node:http';
-import os from 'node:os';
-import path from 'node:path';
-import jwt from 'jsonwebtoken';
-import { MongoMemoryServer } from 'mongodb-memory-server';
-import mongoose from 'mongoose';
-import { io as ioClient, type Socket as ClientSocket } from 'socket.io-client';
-import { createBackendApp } from '../backend/app.ts';
-import { env } from '../backend/config/env.ts';
-import { Conversation } from '../backend/models/Conversation.ts';
+import sodium from 'libsodium-wrappers';
+import { io as ioClient, type Socket } from 'socket.io-client';
+import { createApp } from '../backend/app.ts';
+import { connectDatabase, disconnectDatabase } from '../backend/config/db.ts';
 import { Message } from '../backend/models/Message.ts';
-import { RevokedToken } from '../backend/models/RevokedToken.ts';
-import { SecurityLog } from '../backend/models/SecurityLog.ts';
 import { User } from '../backend/models/User.ts';
 import { initSocketServer } from '../backend/sockets/chatSocket.ts';
-import {
-  buildHkdfContextInfo,
-  deriveMessageKeyHKDF,
-  deriveX25519SharedSecret,
-  encryptAndSignMessage,
-  generateIdentityKeyBundle,
-  verifyAndDecryptMessage,
-} from '../src/crypto/e2ee.ts';
-import type { ClientKeyBundle, EncryptedMessageEnvelope } from '../src/types/messaging.ts';
 
-interface TestResult {
-  category: string;
-  name: string;
-  passed: boolean;
-  detail: string;
+process.env.NODE_ENV = 'test';
+
+interface TestKeys {
+  encPubB64: string;
+  encPriv: Uint8Array;
+  signPubB64: string;
+  signPriv: Uint8Array;
+  fingerprint: string;
 }
 
-const results: TestResult[] = [];
-
-async function runCase(category: string, name: string, fn: () => Promise<void>): Promise<void> {
-  try {
-    await fn();
-    results.push({ category, name, passed: true, detail: 'Passed' });
-    console.log(`  [PASS] (${category}) ${name}`);
-  } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
-    results.push({ category, name, passed: false, detail: msg });
-    console.error(`  [FAIL] (${category}) ${name}: ${msg}`);
-    throw err;
-  }
+function generateTestKeys(): TestKeys {
+  const enc = sodium.crypto_box_keypair();
+  const sign = sodium.crypto_sign_keypair();
+  const encPubB64 = sodium.to_base64(enc.publicKey, sodium.base64_variants.ORIGINAL);
+  const signPubB64 = sodium.to_base64(sign.publicKey, sodium.base64_variants.ORIGINAL);
+  const combined = Buffer.concat([
+    Buffer.from(encPubB64, 'base64'),
+    Buffer.from(signPubB64, 'base64'),
+  ]);
+  const fingerprint = crypto.createHash('sha256').update(combined).digest('hex').toUpperCase();
+  return {
+    encPubB64,
+    encPriv: enc.privateKey,
+    signPubB64,
+    signPriv: sign.privateKey,
+    fingerprint,
+  };
 }
 
-async function apiJson(
-  baseUrl: string,
-  urlPath: string,
-  method: string,
-  body?: unknown,
-  token?: string
-): Promise<{ status: number; data: Record<string, unknown> }> {
-  const res = await fetch(`${baseUrl}${urlPath}`, {
-    method,
-    headers: {
-      'Content-Type': 'application/json',
-      ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    },
-    ...(body !== undefined ? { body: JSON.stringify(body) } : {}),
+async function deriveMessageKey(params: {
+  myEncPriv: Uint8Array;
+  peerEncPubB64: string;
+  conversationId: string;
+  keyVersion: number;
+  saltB64: string;
+}): Promise<Uint8Array> {
+  const peerPub = sodium.from_base64(params.peerEncPubB64, sodium.base64_variants.ORIGINAL);
+  const shared = sodium.crypto_scalarmult(params.myEncPriv, peerPub);
+  const salt = sodium.from_base64(params.saltB64, sodium.base64_variants.ORIGINAL);
+  const info = new TextEncoder().encode(
+    `CipherLine-E2EE-v1|conv:${params.conversationId}|kv:${params.keyVersion}`
+  );
+  const ikm = await crypto.webcrypto.subtle.importKey('raw', shared, 'HKDF', false, ['deriveBits']);
+  const bits = await crypto.webcrypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt, info },
+    ikm,
+    256
+  );
+  return new Uint8Array(bits);
+}
+
+async function buildEnvelope(params: {
+  plaintext: string;
+  conversationId: string;
+  senderId: string;
+  recipientId: string;
+  senderKeys: TestKeys;
+  recipientEncPubB64: string;
+}) {
+  const messageId = `msg_${crypto.randomBytes(12).toString('hex')}`;
+  const clientTimestamp = new Date().toISOString();
+  const keyVersion = 1;
+  const salt = sodium.randombytes_buf(16);
+  const saltB64 = sodium.to_base64(salt, sodium.base64_variants.ORIGINAL);
+  const ephemeralPublicKey = `hkdf-v1:${saltB64}`;
+
+  const msgKey = await deriveMessageKey({
+    myEncPriv: params.senderKeys.encPriv,
+    peerEncPubB64: params.recipientEncPubB64,
+    conversationId: params.conversationId,
+    keyVersion,
+    saltB64,
   });
-  const data = (await res.json().catch(() => ({}))) as Record<string, unknown>;
-  return { status: res.status, data };
+
+  const nonce = sodium.randombytes_buf(sodium.crypto_aead_xchacha20poly1305_ietf_NPUBBYTES);
+  const nonceB64 = sodium.to_base64(nonce, sodium.base64_variants.ORIGINAL);
+  const aad = new TextEncoder().encode(
+    `CipherLine-AAD-v1|${messageId}|${params.conversationId}|${params.senderId}|${params.recipientId}|${clientTimestamp}|${keyVersion}`
+  );
+  const ciphertextBytes = sodium.crypto_aead_xchacha20poly1305_ietf_encrypt(
+    new TextEncoder().encode(params.plaintext),
+    aad,
+    null,
+    nonce,
+    msgKey
+  );
+  const ciphertextB64 = sodium.to_base64(ciphertextBytes, sodium.base64_variants.ORIGINAL);
+
+  const transcript = new TextEncoder().encode(
+    [
+      'CipherLine-Sig-v1',
+      messageId,
+      params.conversationId,
+      params.senderId,
+      params.recipientId,
+      clientTimestamp,
+      String(keyVersion),
+      '1',
+      '1',
+      ephemeralPublicKey,
+      nonceB64,
+      ciphertextB64,
+    ].join('\n')
+  );
+  const sig = sodium.crypto_sign_detached(transcript, params.senderKeys.signPriv);
+  const sigB64 = sodium.to_base64(sig, sodium.base64_variants.ORIGINAL);
+
+  return {
+    messageId,
+    conversationId: params.conversationId,
+    recipientId: params.recipientId,
+    ciphertext: ciphertextB64,
+    nonce: nonceB64,
+    ephemeralPublicKey,
+    signature: sigB64,
+    keyVersion,
+    senderKeyVersion: 1,
+    recipientKeyVersion: 1,
+    clientTimestamp,
+  };
 }
 
-async function main() {
-  process.env.NODE_ENV = 'test';
-  const dbTempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cipherline-persist-'));
-  let mongod: MongoMemoryServer | null = null;
-  let server: http.Server | null = null;
+async function verifyAndDecrypt(params: {
+  envelope: Record<string, unknown> & {
+    messageId: string;
+    conversationId: string;
+    senderId: string;
+    recipientId: string;
+    ciphertext: string;
+    nonce: string;
+    ephemeralPublicKey: string;
+    signature: string;
+    keyVersion: number;
+    senderKeyVersion: number;
+    recipientKeyVersion: number;
+    clientTimestamp: string;
+  };
+  myEncPriv: Uint8Array;
+  peerEncPubB64: string;
+  senderSignPubB64: string;
+}): Promise<string> {
+  const e = params.envelope;
+  const transcript = new TextEncoder().encode(
+    [
+      'CipherLine-Sig-v1',
+      e.messageId,
+      e.conversationId,
+      e.senderId,
+      e.recipientId,
+      e.clientTimestamp,
+      String(e.keyVersion),
+      String(e.senderKeyVersion),
+      String(e.recipientKeyVersion),
+      e.ephemeralPublicKey,
+      e.nonce,
+      e.ciphertext,
+    ].join('\n')
+  );
+  const sigOk = sodium.crypto_sign_verify_detached(
+    sodium.from_base64(e.signature, sodium.base64_variants.ORIGINAL),
+    transcript,
+    sodium.from_base64(params.senderSignPubB64, sodium.base64_variants.ORIGINAL)
+  );
+  if (!sigOk) {
+    throw new Error('SIGNATURE_INVALID');
+  }
+
+  const saltB64 = e.ephemeralPublicKey.replace('hkdf-v1:', '');
+  const msgKey = await deriveMessageKey({
+    myEncPriv: params.myEncPriv,
+    peerEncPubB64: params.peerEncPubB64,
+    conversationId: e.conversationId,
+    keyVersion: e.keyVersion,
+    saltB64,
+  });
+
+  const aad = new TextEncoder().encode(
+    `CipherLine-AAD-v1|${e.messageId}|${e.conversationId}|${e.senderId}|${e.recipientId}|${e.clientTimestamp}|${e.keyVersion}`
+  );
+  const plaintext = sodium.crypto_aead_xchacha20poly1305_ietf_decrypt(
+    null,
+    sodium.from_base64(e.ciphertext, sodium.base64_variants.ORIGINAL),
+    aad,
+    sodium.from_base64(e.nonce, sodium.base64_variants.ORIGINAL),
+    msgKey
+  );
+  return new TextDecoder().decode(plaintext);
+}
+
+async function runTests() {
+  await sodium.ready;
+  await connectDatabase();
+
+  const app = createApp();
+  const server = http.createServer(app);
+  initSocketServer(server);
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address() as { port: number };
+  const baseUrl = `http://127.0.0.1:${address.port}`;
+
+  async function postJson(path: string, body: unknown, token?: string) {
+    const res = await fetch(`${baseUrl}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
+      body: JSON.stringify(body),
+    });
+    return { status: res.status, data: await res.json() };
+  }
+
+  async function getJson(path: string, token?: string) {
+    const res = await fetch(`${baseUrl}${path}`, {
+      headers: token ? { Authorization: `Bearer ${token}` } : {},
+    });
+    return { status: res.status, data: await res.json() };
+  }
+
+  let socketAlice: Socket | null = null;
+  let socketBob: Socket | null = null;
 
   try {
-    mongod = await MongoMemoryServer.create({
-      instance: {
-        dbPath: dbTempDir,
-        storageEngine: 'wiredTiger',
-      },
+    // 1. Register Alice, Bob, Mallory with client-generated keys
+    const aliceKeys = generateTestKeys();
+    const bobKeys = generateTestKeys();
+    const malloryKeys = generateTestKeys();
+
+    const regAlice = await postJson('/api/auth/register', {
+      username: 'alice_sec',
+      email: 'alice@cipherline.test',
+      password: 'StrongPassword#2026!',
+      encryptionPublicKey: aliceKeys.encPubB64,
+      signingPublicKey: aliceKeys.signPubB64,
+      fingerprint: aliceKeys.fingerprint,
     });
-    const mongoUri = mongod.getUri('cipherline_test');
-    await mongoose.connect(mongoUri);
+    assert.equal(regAlice.status, 201, 'Alice registration should succeed');
+    const aliceToken = regAlice.data.token as string;
+    const aliceId = regAlice.data.user.id as string;
+
+    const regBob = await postJson('/api/auth/register', {
+      username: 'bob_sec',
+      email: 'bob@cipherline.test',
+      password: 'StrongPassword#2026!',
+      encryptionPublicKey: bobKeys.encPubB64,
+      signingPublicKey: bobKeys.signPubB64,
+      fingerprint: bobKeys.fingerprint,
+    });
+    assert.equal(regBob.status, 201, 'Bob registration should succeed');
+    const bobToken = regBob.data.token as string;
+    const bobId = regBob.data.user.id as string;
+
+    const regMallory = await postJson('/api/auth/register', {
+      username: 'mallory_sec',
+      email: 'mallory@cipherline.test',
+      password: 'StrongPassword#2026!',
+      encryptionPublicKey: malloryKeys.encPubB64,
+      signingPublicKey: malloryKeys.signPubB64,
+      fingerprint: malloryKeys.fingerprint,
+    });
+    assert.equal(regMallory.status, 201);
+    const malloryToken = regMallory.data.token as string;
+
+    // 2. Argon2id hash stored, never plaintext password
+    const aliceDb = await User.findById(aliceId).select('+passwordHash').lean();
+    assert.ok(aliceDb?.passwordHash.startsWith('$argon2id$'), 'Password must use Argon2id hash');
+    assert.notEqual(aliceDb?.passwordHash, 'StrongPassword#2026!');
+
+    // 3. Generic login error on invalid credentials
+    const badLogin = await postJson('/api/auth/login', {
+      identifier: 'alice_sec',
+      password: 'WrongPassword123!',
+    });
+    assert.equal(badLogin.status, 401);
+    assert.equal(badLogin.data.error, 'Invalid credentials');
+
+    // 4. Reject private key submission on key publish
+    const privReject = await postJson(
+      '/api/keys/publish',
+      {
+        encryptionPublicKey: aliceKeys.encPubB64,
+        signingPublicKey: aliceKeys.signPubB64,
+        fingerprint: aliceKeys.fingerprint,
+        encryptionPrivateKey: 'leaked',
+      },
+      aliceToken
+    );
+    assert.equal(privReject.status, 400);
+
+    // 5. Create 1-to-1 conversation
+    const convRes = await postJson('/api/conversations', { recipientId: bobId }, aliceToken);
+    assert.equal(convRes.status, 201);
+    const conversationId = convRes.data.conversation.id as string;
+
+    // 6. Reject plaintext message on REST
+    const plaintextReject = await postJson(
+      '/api/messages',
+      { conversationId, recipientId: bobId, plaintext: 'hello world' },
+      aliceToken
+    );
+    assert.equal(plaintextReject.status, 400);
+
+    // 7. Encrypt + sign message client-side, send via REST, verify DB stores zero plaintext
+    const secretText = 'Confidential BTech major project test payload 2026';
+    const env1 = await buildEnvelope({
+      plaintext: secretText,
+      conversationId,
+      senderId: aliceId,
+      recipientId: bobId,
+      senderKeys: aliceKeys,
+      recipientEncPubB64: bobKeys.encPubB64,
+    });
+    const sendRes = await postJson('/api/messages', env1, aliceToken);
+    assert.equal(sendRes.status, 201);
+
+    const dbMsg = await Message.findOne({ messageId: env1.messageId }).lean();
+    assert.ok(dbMsg);
+    assert.equal(JSON.stringify(dbMsg).includes(secretText), false, 'DB must never contain plaintext');
+
+    // 8. Bob verifies Ed25519 signature and decrypts successfully
+    const decryptedByBob = await verifyAndDecrypt({
+      envelope: sendRes.data.message,
+      myEncPriv: bobKeys.encPriv,
+      peerEncPubB64: aliceKeys.encPubB64,
+      senderSignPubB64: aliceKeys.signPubB64,
+    });
+    assert.equal(decryptedByBob, secretText);
+
+    // 9. Modified ciphertext or invalid signature fails verification
+    const tamperedSig = {
+      ...sendRes.data.message,
+      signature: Buffer.from(crypto.randomBytes(64)).toString('base64'),
+    };
+    await assert.rejects(
+      verifyAndDecrypt({
+        envelope: tamperedSig,
+        myEncPriv: bobKeys.encPriv,
+        peerEncPubB64: aliceKeys.encPubB64,
+        senderSignPubB64: aliceKeys.signPubB64,
+      }),
+      /SIGNATURE_INVALID/
+    );
+
+    const flippedCiphertextBytes = Buffer.from(sendRes.data.message.ciphertext, 'base64');
+    flippedCiphertextBytes[0] ^= 0xff;
+    const tamperedCipher = {
+      ...sendRes.data.message,
+      ciphertext: flippedCiphertextBytes.toString('base64'),
+    };
+    await assert.rejects(
+      verifyAndDecrypt({
+        envelope: tamperedCipher,
+        myEncPriv: bobKeys.encPriv,
+        peerEncPubB64: aliceKeys.encPubB64,
+        senderSignPubB64: aliceKeys.signPubB64,
+      })
+    );
+
+    // 10. Unauthorized 3rd-party user blocked from reading conversation & JWT revocation on logout
+    const malloryRead = await getJson(`/api/messages/${conversationId}`, malloryToken);
+    assert.equal(malloryRead.status, 403);
+
+    const logoutAlice = await postJson('/api/auth/logout', {}, aliceToken);
+    assert.equal(logoutAlice.status, 200);
+    const revokedAccess = await getJson('/api/auth/me', aliceToken);
+    assert.equal(revokedAccess.status, 401);
+
+    // 11. Real-time Socket.IO delivery between fresh Alice login and Bob
+    const reloginAlice = await postJson('/api/auth/login', {
+      identifier: 'alice_sec',
+      password: 'StrongPassword#2026!',
+    });
+    assert.equal(reloginAlice.status, 200);
+    const freshAliceToken = reloginAlice.data.token as string;
+
+    socketAlice = ioClient(baseUrl, { auth: { token: freshAliceToken }, transports: ['websocket'] });
+    socketBob = ioClient(baseUrl, { auth: { token: bobToken }, transports: ['websocket'] });
+
     await Promise.all([
-      User.init(),
-      Conversation.init(),
-      Message.init(),
-      SecurityLog.init(),
-      RevokedToken.init(),
+      new Promise<void>((resolve) => socketAlice!.on('connect', () => resolve())),
+      new Promise<void>((resolve) => socketBob!.on('connect', () => resolve())),
     ]);
 
-    const app = createBackendApp();
-    server = http.createServer(app);
-    const io = initSocketServer(server);
-
-    await new Promise<void>((resolve) => {
-      server!.listen(0, '127.0.0.1', () => resolve());
-    });
-    const addr = server.address();
-    assert.ok(addr && typeof addr === 'object');
-    const baseUrl = `http://127.0.0.1:${addr.port}`;
-
-    console.log(`\nRunning CipherLine E2EE Security & Integration Tests against ${baseUrl}\n`);
-
-    let aliceKeys!: ClientKeyBundle;
-    let bobKeys!: ClientKeyBundle;
-    let malloryKeys!: ClientKeyBundle;
-    let aliceToken = '';
-    let bobToken = '';
-    let malloryToken = '';
-    let aliceId = '';
-    let bobId = '';
-    let malloryId = '';
-    let convId = '';
-    let savedEnvelope!: EncryptedMessageEnvelope;
-    const secretPlaintext = 'Confidential BTech CSE E2EE Viva Message #42!';
-
-    // 1. Authentication Tests
-    await runCase('Authentication', 'Register accounts with Argon2id + public keys', async () => {
-      aliceKeys = await generateIdentityKeyBundle(1);
-      bobKeys = await generateIdentityKeyBundle(1);
-      malloryKeys = await generateIdentityKeyBundle(1);
-
-      const resA = await apiJson(baseUrl, '/api/auth/register', 'POST', {
-        username: 'alice_test',
-        email: 'alice@example.edu',
-        password: 'StrongPassword!99',
-        encryptionPublicKey: aliceKeys.encryptionPublicKey,
-        signingPublicKey: aliceKeys.signingPublicKey,
-        fingerprint: aliceKeys.fingerprint,
-      });
-      assert.equal(resA.status, 201);
-      aliceToken = String(resA.data.token);
-      aliceId = String((resA.data.user as { id: string }).id);
-
-      const resB = await apiJson(baseUrl, '/api/auth/register', 'POST', {
-        username: 'bob_test',
-        email: 'bob@example.edu',
-        password: 'StrongPassword!88',
-        encryptionPublicKey: bobKeys.encryptionPublicKey,
-        signingPublicKey: bobKeys.signingPublicKey,
-        fingerprint: bobKeys.fingerprint,
-      });
-      assert.equal(resB.status, 201);
-      bobToken = String(resB.data.token);
-      bobId = String((resB.data.user as { id: string }).id);
-
-      const resM = await apiJson(baseUrl, '/api/auth/register', 'POST', {
-        username: 'mallory_test',
-        email: 'mallory@example.edu',
-        password: 'StrongPassword!77',
-        encryptionPublicKey: malloryKeys.encryptionPublicKey,
-        signingPublicKey: malloryKeys.signingPublicKey,
-        fingerprint: malloryKeys.fingerprint,
-      });
-      assert.equal(resM.status, 201);
-      malloryToken = String(resM.data.token);
-      malloryId = String((resM.data.user as { id: string }).id);
-
-      const dbAlice = await User.findById(aliceId).select('+passwordHash').lean();
-      assert.ok(dbAlice?.passwordHash.startsWith('$argon2id$'));
+    const liveText = 'Real-time Socket.IO E2EE envelope!';
+    const liveEnv = await buildEnvelope({
+      plaintext: liveText,
+      conversationId,
+      senderId: aliceId,
+      recipientId: bobId,
+      senderKeys: aliceKeys,
+      recipientEncPubB64: bobKeys.encPubB64,
     });
 
-    await runCase('Authentication', 'Reject duplicate username or email', async () => {
-      const dup = await apiJson(baseUrl, '/api/auth/register', 'POST', {
-        username: 'alice_test',
-        email: 'alice_other@example.edu',
-        password: 'StrongPassword!99',
-      });
-      assert.equal(dup.status, 409);
+    const receivedPromise = new Promise<Record<string, unknown>>((resolve) => {
+      socketBob!.once('message:new', (msg: Record<string, unknown>) => resolve(msg));
     });
 
-    await runCase('Authentication', 'Login with correct password', async () => {
-      const loginOk = await apiJson(baseUrl, '/api/auth/login', 'POST', {
-        identifier: 'alice_test',
-        password: 'StrongPassword!99',
-      });
-      assert.equal(loginOk.status, 200);
-      assert.ok(typeof loginOk.data.token === 'string');
-      aliceToken = String(loginOk.data.token);
+    const ack = await new Promise<{ ok: boolean }>((resolve) => {
+      socketAlice!.emit('message:send', liveEnv, resolve);
     });
+    assert.equal(ack.ok, true);
 
-    await runCase('Authentication', 'Reject incorrect password with generic error', async () => {
-      const badPass = await apiJson(baseUrl, '/api/auth/login', 'POST', {
-        identifier: 'alice_test',
-        password: 'WrongPassword!123',
-      });
-      assert.equal(badPass.status, 401);
-      assert.equal(badPass.data.error, 'Invalid credentials');
+    const receivedByBob = await receivedPromise;
+    const decryptedLive = await verifyAndDecrypt({
+      envelope: receivedByBob as never,
+      myEncPriv: bobKeys.encPriv,
+      peerEncPubB64: aliceKeys.encPubB64,
+      senderSignPubB64: aliceKeys.signPubB64,
     });
+    assert.equal(decryptedLive, liveText);
 
-    await runCase('Authentication', 'Reject invalid, expired, and revoked JWTs', async () => {
-      const expired = jwt.sign(
-        { sub: aliceId, username: 'alice_test', jti: 'exp-jti-1' },
-        env.jwtSecret,
-        { expiresIn: -10 }
-      );
-      const resExp = await apiJson(baseUrl, '/api/auth/me', 'GET', undefined, expired);
-      assert.equal(resExp.status, 401);
-
-      const resBad = await apiJson(baseUrl, '/api/auth/me', 'GET', undefined, 'bad.jwt.token');
-      assert.equal(resBad.status, 401);
-
-      // Logout revokes active JWT
-      const tempLogin = await apiJson(baseUrl, '/api/auth/login', 'POST', {
-        identifier: 'mallory_test',
-        password: 'StrongPassword!77',
-      });
-      const tempToken = String(tempLogin.data.token);
-      const logoutRes = await apiJson(baseUrl, '/api/auth/logout', 'POST', undefined, tempToken);
-      assert.equal(logoutRes.status, 200);
-
-      const afterLogout = await apiJson(baseUrl, '/api/auth/me', 'GET', undefined, tempToken);
-      assert.equal(afterLogout.status, 401);
-    });
-
-    // 2. Key Exchange & Encryption Tests
-    await runCase('Cryptography', 'Both clients derive identical X25519 + HKDF-SHA256 keys', async () => {
-      const convRes = await apiJson(
-        baseUrl,
-        '/api/conversations',
-        'POST',
-        { recipientId: bobId },
-        aliceToken
-      );
-      assert.equal(convRes.status, 201);
-      convId = String((convRes.data.conversation as { id: string }).id);
-
-      const secretAlice = await deriveX25519SharedSecret(
-        aliceKeys.encryptionPrivateKey,
-        bobKeys.encryptionPublicKey
-      );
-      const secretBob = await deriveX25519SharedSecret(
-        bobKeys.encryptionPrivateKey,
-        aliceKeys.encryptionPublicKey
-      );
-      assert.deepEqual(Buffer.from(secretAlice), Buffer.from(secretBob));
-
-      const salt = new Uint8Array(16).fill(7);
-      const info = buildHkdfContextInfo({
-        conversationId: convId,
-        senderId: aliceId,
-        recipientId: bobId,
-        senderKeyVersion: 1,
-        recipientKeyVersion: 1,
-      });
-      const keyA = await deriveMessageKeyHKDF(secretAlice, salt, info);
-      const keyB = await deriveMessageKeyHKDF(secretBob, salt, info);
-      assert.deepEqual(Buffer.from(keyA), Buffer.from(keyB));
-    });
-
-    await runCase('Encryption', 'Encrypt on Alice, persist ciphertext in MongoDB, confirm plaintext absent, decrypt on Bob', async () => {
-      savedEnvelope = await encryptAndSignMessage({
-        plaintext: secretPlaintext,
-        conversationId: convId,
-        senderId: aliceId,
-        recipientId: bobId,
-        senderKeys: aliceKeys,
-        recipientPublicKeys: {
-          encryptionPublicKey: bobKeys.encryptionPublicKey,
-          signingPublicKey: bobKeys.signingPublicKey,
-          keyVersion: 1,
-        },
-      });
-
-      const sendRes = await apiJson(baseUrl, '/api/messages', 'POST', savedEnvelope, aliceToken);
-      assert.equal(sendRes.status, 201);
-
-      const rawDbMsg = await Message.findOne({ messageId: savedEnvelope.messageId }).lean();
-      assert.ok(rawDbMsg);
-      const serializedRaw = JSON.stringify(rawDbMsg);
-      assert.equal(serializedRaw.includes(secretPlaintext), false);
-      assert.equal(serializedRaw.includes('Confidential BTech'), false);
-
-      const bobDecrypt = await verifyAndDecryptMessage({
-        envelope: savedEnvelope,
-        myUserId: bobId,
-        myKeys: bobKeys,
-        senderSigningPublicKey: aliceKeys.signingPublicKey,
-        peerEncryptionPublicKey: aliceKeys.encryptionPublicKey,
-      });
-      assert.equal(bobDecrypt.ok, true);
-      assert.equal(bobDecrypt.signatureValid, true);
-      assert.equal(bobDecrypt.plaintext, secretPlaintext);
-    });
-
-    // 3. Digital Signature Tests
-    await runCase('Signatures', 'Reject modified ciphertext, modified signature, and wrong sender identity', async () => {
-      const tamperedCipher = {
-        ...savedEnvelope,
-        ciphertext:
-          (savedEnvelope.ciphertext[0] === 'A' ? 'B' : 'A') +
-          savedEnvelope.ciphertext.slice(1),
-      };
-      const resTamperCipher = await verifyAndDecryptMessage({
-        envelope: tamperedCipher,
-        myUserId: bobId,
-        myKeys: bobKeys,
-        senderSigningPublicKey: aliceKeys.signingPublicKey,
-        peerEncryptionPublicKey: aliceKeys.encryptionPublicKey,
-      });
-      assert.equal(resTamperCipher.ok, false);
-      assert.equal(resTamperCipher.signatureValid, false);
-      assert.equal(resTamperCipher.errorType, 'SIGNATURE_INVALID');
-
-      const tamperedSig = {
-        ...savedEnvelope,
-        signature:
-          (savedEnvelope.signature[0] === 'A' ? 'B' : 'A') +
-          savedEnvelope.signature.slice(1),
-      };
-      const resTamperSig = await verifyAndDecryptMessage({
-        envelope: tamperedSig,
-        myUserId: bobId,
-        myKeys: bobKeys,
-        senderSigningPublicKey: aliceKeys.signingPublicKey,
-        peerEncryptionPublicKey: aliceKeys.encryptionPublicKey,
-      });
-      assert.equal(resTamperSig.ok, false);
-      assert.equal(resTamperSig.signatureValid, false);
-
-      // Verify against wrong sender identity (Mallory's signing public key)
-      const resWrongSender = await verifyAndDecryptMessage({
-        envelope: savedEnvelope,
-        myUserId: bobId,
-        myKeys: bobKeys,
-        senderSigningPublicKey: malloryKeys.signingPublicKey,
-        peerEncryptionPublicKey: aliceKeys.encryptionPublicKey,
-      });
-      assert.equal(resWrongSender.ok, false);
-      assert.equal(resWrongSender.signatureValid, false);
-    });
-
-    // 4. Authorization & Input Rejection Tests
-    await runCase('Authorization', 'Reject unauthorized conversation read, send, read receipts, plaintext, and private keys', async () => {
-      const unauthRead = await apiJson(
-        baseUrl,
-        `/api/messages/${convId}`,
-        'GET',
-        undefined,
-        malloryToken
-      );
-      assert.equal(unauthRead.status, 403);
-
-      const unauthSend = await apiJson(
-        baseUrl,
-        '/api/messages',
-        'POST',
-        savedEnvelope,
-        malloryToken
-      );
-      assert.equal(unauthSend.status, 403);
-
-      // Sender Alice cannot forge read receipt on her own sent message
-      const unauthReceipt = await apiJson(
-        baseUrl,
-        `/api/messages/${savedEnvelope.messageId}/read`,
-        'PATCH',
-        undefined,
-        aliceToken
-      );
-      assert.equal(unauthReceipt.status, 403);
-
-      // Reject plaintext payloads
-      const rejectPlaintext = await apiJson(
-        baseUrl,
-        '/api/messages',
-        'POST',
-        { plaintext: 'Hello unencrypted' },
-        aliceToken
-      );
-      assert.equal(rejectPlaintext.status, 400);
-
-      // Reject private key transmission
-      const rejectPriv = await apiJson(
-        baseUrl,
-        '/api/keys/publish',
-        'POST',
-        {
-          encryptionPublicKey: aliceKeys.encryptionPublicKey,
-          signingPublicKey: aliceKeys.signingPublicKey,
-          fingerprint: aliceKeys.fingerprint,
-          privateKey: aliceKeys.encryptionPrivateKey,
-        },
-        aliceToken
-      );
-      assert.equal(rejectPriv.status, 400);
-    });
-
-    // 5. Real-time Socket.IO Tests
-    await runCase('Realtime', 'Socket.IO auth, instant encrypted delivery, read receipts, and reconnection', async () => {
-      // Unauthenticated socket rejected
-      await new Promise<void>((resolve, reject) => {
-        const badSock = ioClient(baseUrl, { auth: {}, reconnection: false });
-        badSock.on('connect_error', () => {
-          badSock.close();
-          resolve();
-        });
-        badSock.on('connect', () => {
-          badSock.close();
-          reject(new Error('Unauthenticated socket should not connect'));
-        });
-      });
-
-      const aliceSock: ClientSocket = ioClient(baseUrl, { auth: { token: aliceToken } });
-      const bobSock: ClientSocket = ioClient(baseUrl, { auth: { token: bobToken } });
-
-      await Promise.all([
-        new Promise<void>((resolve) => aliceSock.on('connect', () => resolve())),
-        new Promise<void>((resolve) => bobSock.on('connect', () => resolve())),
-      ]);
-
-      await new Promise<void>((resolve, reject) => {
-        bobSock.emit('conversation:join', { conversationId: convId }, (ack: { ok: boolean }) => {
-          if (ack?.ok) resolve();
-          else reject(new Error('Bob failed to join conversation room'));
-        });
-      });
-
-      // Unauthorized user Mallory cannot join Alice-Bob room
-      const mallorySock: ClientSocket = ioClient(baseUrl, { auth: { token: malloryToken } });
-      await new Promise<void>((resolve) => mallorySock.on('connect', () => resolve()));
-      await new Promise<void>((resolve, reject) => {
-        mallorySock.emit('conversation:join', { conversationId: convId }, (ack: { ok: boolean }) => {
-          if (!ack?.ok) resolve();
-          else reject(new Error('Mallory should be blocked from joining Alice-Bob room'));
-        });
-      });
-      mallorySock.disconnect();
-
-      const liveText = 'Real-time Socket.IO E2EE payload #2!';
-      const liveEnvelope = await encryptAndSignMessage({
-        plaintext: liveText,
-        conversationId: convId,
-        senderId: aliceId,
-        recipientId: bobId,
-        senderKeys: aliceKeys,
-        recipientPublicKeys: {
-          encryptionPublicKey: bobKeys.encryptionPublicKey,
-          signingPublicKey: bobKeys.signingPublicKey,
-          keyVersion: 1,
-        },
-      });
-
-      const receivedByBob = new Promise<EncryptedMessageEnvelope>((resolve) => {
-        bobSock.once('message:new', (msg: EncryptedMessageEnvelope) => resolve(msg));
-      });
-      const readByAlice = new Promise<{ messageId: string; readAt: string }>((resolve) => {
-        aliceSock.once('message:read', (receipt: { messageId: string; readAt: string }) =>
-          resolve(receipt)
-        );
-      });
-
-      await new Promise<void>((resolve, reject) => {
-        aliceSock.emit('message:send', liveEnvelope, (ack: { ok: boolean; error?: string }) => {
-          if (ack?.ok) resolve();
-          else reject(new Error(ack?.error || 'Socket send failed'));
-        });
-      });
-
-      const deliveredEnv = await receivedByBob;
-      assert.equal(deliveredEnv.messageId, liveEnvelope.messageId);
-      const bobDecrypted = await verifyAndDecryptMessage({
-        envelope: deliveredEnv,
-        myUserId: bobId,
-        myKeys: bobKeys,
-        senderSigningPublicKey: aliceKeys.signingPublicKey,
-        peerEncryptionPublicKey: aliceKeys.encryptionPublicKey,
-      });
-      assert.equal(bobDecrypted.ok, true);
-      assert.equal(bobDecrypted.plaintext, liveText);
-
-      // Bob emits read receipt
-      bobSock.emit('message:read', { messageId: liveEnvelope.messageId });
-      const receipt = await readByAlice;
-      assert.equal(receipt.messageId, liveEnvelope.messageId);
-      assert.ok(receipt.readAt);
-
-      // Reconnection test
-      bobSock.disconnect();
-      bobSock.connect();
-      await new Promise<void>((resolve) => bobSock.once('connect', () => resolve()));
-
-      aliceSock.disconnect();
-      bobSock.disconnect();
-    });
-
-    // 6. Database Indexes, Safe Logging, and Persistence After Restart
-    await runCase('Database', 'Verify indexes, zero sensitive logging, and persistence across restart', async () => {
-      const userIndexes = await User.collection.indexes();
-      assert.ok(userIndexes.some((idx) => idx.key?.username === 1 && idx.unique));
-      assert.ok(userIndexes.some((idx) => idx.key?.email === 1 && idx.unique));
-
-      const msgIndexes = await Message.collection.indexes();
-      assert.ok(msgIndexes.some((idx) => idx.key?.messageId === 1 && idx.unique));
-
-      const logs = await SecurityLog.find({}).lean();
-      assert.ok(logs.length > 0);
-      const logsJson = JSON.stringify(logs);
-      assert.equal(logsJson.includes(secretPlaintext), false);
-      assert.equal(logsJson.includes('StrongPassword!99'), false);
-      assert.equal(logsJson.includes(aliceKeys.encryptionPrivateKey), false);
-
-      // Simulate server + MongoDB restart using same WiredTiger dbPath
-      io.close();
-      await new Promise<void>((resolve) => server!.close(() => resolve()));
-      await mongoose.disconnect();
-      await mongod!.stop();
-
-      mongod = await MongoMemoryServer.create({
-        instance: {
-          dbPath: dbTempDir,
-          storageEngine: 'wiredTiger',
-        },
-      });
-      await mongoose.connect(mongod.getUri('cipherline_test'));
-      const persistedMessages = await Message.countDocuments({ conversationId: convId });
-      assert.equal(persistedMessages, 2);
-      const persistedAlice = await User.findById(aliceId).lean();
-      assert.equal(persistedAlice?.username, 'alice_test');
-      void malloryId;
-    });
-
-    console.log(`\nAll ${results.length} security & integration tests PASSED!\n`);
+    console.log('ALL 11 SECURITY & E2EE INTEGRATION TESTS PASSED');
   } finally {
-    if (server && server.listening) {
-      await new Promise<void>((resolve) => server!.close(() => resolve()));
-    }
-    if (mongoose.connection.readyState !== 0) {
-      await mongoose.disconnect();
-    }
-    if (mongod) {
-      await mongod.stop();
-    }
-    fs.rmSync(dbTempDir, { recursive: true, force: true });
+    socketAlice?.disconnect();
+    socketBob?.disconnect();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    await disconnectDatabase();
   }
 }
 
-main().catch((err) => {
-  console.error('\nIntegration suite failed:', err);
+runTests().catch((err) => {
+  console.error('Security integration test failure:', err);
   process.exit(1);
 });

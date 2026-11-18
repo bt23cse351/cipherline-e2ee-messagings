@@ -14,9 +14,10 @@ const revokedTokenSchema = new Schema<IRevokedToken>({
   expiresAt: {
     type: Date,
     required: true,
-    index: { expires: 0 },
   },
 });
+
+revokedTokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 export const RevokedToken =
   (mongoose.models.RevokedToken as mongoose.Model<IRevokedToken>) ||

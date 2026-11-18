@@ -49,7 +49,6 @@ export async function register(req: Request, res: Response): Promise<void> {
   const { username, email, password, encryptionPublicKey, signingPublicKey, fingerprint } =
     parsed.data;
 
-  // Reject if client mistakenly tries to transmit any private key material
   const rawBody = req.body as Record<string, unknown>;
   if (
     'encryptionPrivateKey' in rawBody ||

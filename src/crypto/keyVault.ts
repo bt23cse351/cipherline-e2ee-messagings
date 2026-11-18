@@ -1,22 +1,29 @@
-import type { ClientKeyBundle, VerifiedContactRecord } from '../types/messaging';
+import type { IdentityKeyBundle, VerifiedContactRecord } from '../types/messaging';
 
-interface EncryptedVaultRecord {
-  version: number;
+const DB_NAME = 'CipherLineVaultDB';
+const DB_VERSION = 1;
+const STORE_NAME = 'vaults';
+const PBKDF2_ITERATIONS = 310000;
+
+interface EncryptedVaultEnvelope {
+  version: 1;
   userId: string;
   kdf: 'PBKDF2-SHA256';
   iterations: number;
-  salt: string;
-  iv: string;
-  ciphertext: string;
+  cipher: 'AES-256-GCM';
+  saltB64: string;
+  ivB64: string;
+  ciphertextB64: string;
+  publicBundle: {
+    encryptionPublicKey: string;
+    signingPublicKey: string;
+    fingerprint: string;
+    keyVersion: number;
+  };
   updatedAt: string;
 }
 
-const VAULT_STORAGE_PREFIX = 'cipherline_encrypted_vault_v1_';
-const VERIFIED_CONTACTS_PREFIX = 'cipherline_verified_contacts_v1_';
-const DB_NAME = 'cipherline_keystore_db';
-const STORE_NAME = 'encrypted_vaults';
-
-function toBase64(bytes: Uint8Array): string {
+function bytesToB64(bytes: Uint8Array): string {
   let binary = '';
   for (let i = 0; i < bytes.length; i++) {
     binary += String.fromCharCode(bytes[i]);
@@ -24,7 +31,7 @@ function toBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-function fromBase64(b64: string): Uint8Array {
+function b64ToBytes(b64: string): Uint8Array {
   const binary = atob(b64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) {
@@ -34,48 +41,14 @@ function fromBase64(b64: string): Uint8Array {
 }
 
 function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
-  const copy = new Uint8Array(bytes.byteLength);
-  copy.set(bytes);
-  return copy.buffer;
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
 }
 
-async function deriveVaultWrappingKey(
-  password: string,
-  salt: Uint8Array,
-  iterations = 310000
-): Promise<CryptoKey> {
-  const passwordKey = await globalThis.crypto.subtle.importKey(
-    'raw',
-    new TextEncoder().encode(password),
-    'PBKDF2',
-    false,
-    ['deriveKey']
-  );
-
-  return globalThis.crypto.subtle.deriveKey(
-    {
-      name: 'PBKDF2',
-      hash: 'SHA-256',
-      salt: toArrayBuffer(salt),
-      iterations,
-    },
-    passwordKey,
-    {
-      name: 'AES-GCM',
-      length: 256,
-    },
-    false,
-    ['encrypt', 'decrypt']
-  );
-}
-
-function openVaultDB(): Promise<IDBDatabase | null> {
-  if (typeof indexedDB === 'undefined') {
-    return Promise.resolve(null);
-  }
+async function openVaultDB(): Promise<IDBDatabase | null> {
+  if (typeof indexedDB === 'undefined') return null;
   return new Promise((resolve) => {
     try {
-      const request = indexedDB.open(DB_NAME, 1);
+      const request = indexedDB.open(DB_NAME, DB_VERSION);
       request.onupgradeneeded = () => {
         const db = request.result;
         if (!db.objectStoreNames.contains(STORE_NAME)) {
@@ -90,210 +63,252 @@ function openVaultDB(): Promise<IDBDatabase | null> {
   });
 }
 
-async function writeVaultRecord(record: EncryptedVaultRecord): Promise<void> {
+async function putVaultRecord(record: EncryptedVaultEnvelope): Promise<void> {
+  const serialized = JSON.stringify(record);
+  try {
+    localStorage.setItem(`cipherline_vault_${record.userId}`, serialized);
+  } catch {
+    // Ignore storage quota fallback
+  }
+
   const db = await openVaultDB();
-  if (db) {
-    await new Promise<void>((resolve, reject) => {
+  if (!db) return;
+
+  await new Promise<void>((resolve) => {
+    try {
       const tx = db.transaction(STORE_NAME, 'readwrite');
       tx.objectStore(STORE_NAME).put(record);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    }).catch(() => {
-      // Fallback below
-    });
-  }
-  try {
-    localStorage.setItem(`${VAULT_STORAGE_PREFIX}${record.userId}`, JSON.stringify(record));
-  } catch {
-    // Ignore storage quota errors
-  }
-}
-
-async function readVaultRecord(userId: string): Promise<EncryptedVaultRecord | null> {
-  const db = await openVaultDB();
-  if (db) {
-    const fromDb = await new Promise<EncryptedVaultRecord | null>((resolve) => {
-      const tx = db.transaction(STORE_NAME, 'readonly');
-      const req = tx.objectStore(STORE_NAME).get(userId);
-      req.onsuccess = () => resolve((req.result as EncryptedVaultRecord) || null);
-      req.onerror = () => resolve(null);
-    });
-    if (fromDb) return fromDb;
-  }
-
-  try {
-    const raw = localStorage.getItem(`${VAULT_STORAGE_PREFIX}${userId}`);
-    if (!raw) return null;
-    return JSON.parse(raw) as EncryptedVaultRecord;
-  } catch {
-    return null;
-  }
-}
-
-export async function hasLocalVault(userId: string): Promise<boolean> {
-  const record = await readVaultRecord(userId);
-  return Boolean(record);
-}
-
-export async function encryptAndSaveVault(
-  userId: string,
-  password: string,
-  bundle: ClientKeyBundle
-): Promise<void> {
-  const salt = new Uint8Array(16);
-  const iv = new Uint8Array(12);
-  globalThis.crypto.getRandomValues(salt);
-  globalThis.crypto.getRandomValues(iv);
-
-  const iterations = 310000;
-  const wrappingKey = await deriveVaultWrappingKey(password, salt, iterations);
-
-  const plaintext = new TextEncoder().encode(JSON.stringify(bundle));
-  const aad = new TextEncoder().encode(`CipherLine-Vault-v1|${userId}`);
-
-  const encrypted = await globalThis.crypto.subtle.encrypt(
-    {
-      name: 'AES-GCM',
-      iv: toArrayBuffer(iv),
-      additionalData: toArrayBuffer(aad),
-    },
-    wrappingKey,
-    toArrayBuffer(plaintext)
-  );
-
-  const record: EncryptedVaultRecord = {
-    version: 1,
-    userId,
-    kdf: 'PBKDF2-SHA256',
-    iterations,
-    salt: toBase64(salt),
-    iv: toBase64(iv),
-    ciphertext: toBase64(new Uint8Array(encrypted)),
-    updatedAt: new Date().toISOString(),
-  };
-
-  await writeVaultRecord(record);
-}
-
-export async function unlockLocalVault(
-  userId: string,
-  password: string
-): Promise<ClientKeyBundle> {
-  const record = await readVaultRecord(userId);
-  if (!record) {
-    throw new Error('NO_VAULT');
-  }
-
-  const salt = fromBase64(record.salt);
-  const iv = fromBase64(record.iv);
-  const ciphertext = fromBase64(record.ciphertext);
-
-  const wrappingKey = await deriveVaultWrappingKey(password, salt, record.iterations);
-  const aad = new TextEncoder().encode(`CipherLine-Vault-v1|${userId}`);
-
-  try {
-    const decrypted = await globalThis.crypto.subtle.decrypt(
-      {
-        name: 'AES-GCM',
-        iv: toArrayBuffer(iv),
-        additionalData: toArrayBuffer(aad),
-      },
-      wrappingKey,
-      toArrayBuffer(ciphertext)
-    );
-    const json = new TextDecoder().decode(decrypted);
-    return JSON.parse(json) as ClientKeyBundle;
-  } catch {
-    throw new Error('INVALID_VAULT_PASSWORD');
-  }
-}
-
-export async function exportEncryptedVaultBackup(
-  userId: string,
-  backupPassphrase: string,
-  bundle: ClientKeyBundle
-): Promise<string> {
-  const salt = new Uint8Array(16);
-  const iv = new Uint8Array(12);
-  globalThis.crypto.getRandomValues(salt);
-  globalThis.crypto.getRandomValues(iv);
-
-  const wrappingKey = await deriveVaultWrappingKey(backupPassphrase, salt, 310000);
-  const payload = new TextEncoder().encode(JSON.stringify({ userId, bundle }));
-  const encrypted = await globalThis.crypto.subtle.encrypt(
-    {
-      name: 'AES-GCM',
-      iv: toArrayBuffer(iv),
-    },
-    wrappingKey,
-    toArrayBuffer(payload)
-  );
-
-  return JSON.stringify({
-    format: 'CIPHERLINE_ENCRYPTED_KEY_BACKUP_V1',
-    userId,
-    iterations: 310000,
-    salt: toBase64(salt),
-    iv: toBase64(iv),
-    ciphertext: toBase64(new Uint8Array(encrypted)),
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => {
+        db.close();
+        resolve();
+      };
+    } catch {
+      db.close();
+      resolve();
+    }
   });
 }
 
-export async function importEncryptedVaultBackup(
-  expectedUserId: string,
-  backupPassphrase: string,
-  backupJsonString: string,
-  localVaultPassword: string
-): Promise<ClientKeyBundle> {
-  const parsed = JSON.parse(backupJsonString.trim()) as {
-    format?: string;
-    userId?: string;
-    iterations?: number;
-    salt?: string;
-    iv?: string;
-    ciphertext?: string;
-  };
-
-  if (
-    parsed.format !== 'CIPHERLINE_ENCRYPTED_KEY_BACKUP_V1' ||
-    !parsed.salt ||
-    !parsed.iv ||
-    !parsed.ciphertext
-  ) {
-    throw new Error('Invalid encrypted vault backup format');
+async function getVaultRecord(userId: string): Promise<EncryptedVaultEnvelope | null> {
+  const db = await openVaultDB();
+  if (db) {
+    const fromIdb = await new Promise<EncryptedVaultEnvelope | null>((resolve) => {
+      try {
+        const tx = db.transaction(STORE_NAME, 'readonly');
+        const req = tx.objectStore(STORE_NAME).get(userId);
+        req.onsuccess = () => {
+          db.close();
+          resolve((req.result as EncryptedVaultEnvelope) || null);
+        };
+        req.onerror = () => {
+          db.close();
+          resolve(null);
+        };
+      } catch {
+        db.close();
+        resolve(null);
+      }
+    });
+    if (fromIdb) return fromIdb;
   }
 
-  if (parsed.userId && parsed.userId !== expectedUserId) {
-    throw new Error('This key backup belongs to a different user account');
+  try {
+    const raw = localStorage.getItem(`cipherline_vault_${userId}`);
+    if (raw) {
+      return JSON.parse(raw) as EncryptedVaultEnvelope;
+    }
+  } catch {
+    return null;
   }
+  return null;
+}
 
-  const wrappingKey = await deriveVaultWrappingKey(
-    backupPassphrase,
-    fromBase64(parsed.salt),
-    parsed.iterations || 310000
+async function deriveVaultWrappingKey(
+  passphrase: string,
+  salt: Uint8Array,
+  iterations: number
+): Promise<CryptoKey> {
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw',
+    toArrayBuffer(new TextEncoder().encode(passphrase)),
+    'PBKDF2',
+    false,
+    ['deriveKey']
   );
 
-  const decrypted = await globalThis.crypto.subtle.decrypt(
+  return crypto.subtle.deriveKey(
     {
-      name: 'AES-GCM',
-      iv: toArrayBuffer(fromBase64(parsed.iv)),
+      name: 'PBKDF2',
+      salt: toArrayBuffer(salt),
+      iterations,
+      hash: 'SHA-256',
     },
-    wrappingKey,
-    toArrayBuffer(fromBase64(parsed.ciphertext))
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
   );
+}
 
-  const data = JSON.parse(new TextDecoder().decode(decrypted)) as {
-    userId: string;
-    bundle: ClientKeyBundle;
+export async function hasEncryptedVault(userId: string): Promise<boolean> {
+  const record = await getVaultRecord(userId);
+  return Boolean(record && record.ciphertextB64);
+}
+
+export async function saveEncryptedVault(
+  userId: string,
+  bundle: IdentityKeyBundle,
+  passphrase: string
+): Promise<void> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const aesKey = await deriveVaultWrappingKey(passphrase, salt, PBKDF2_ITERATIONS);
+
+  const plaintext = new TextEncoder().encode(JSON.stringify(bundle));
+  const ciphertextBuf = await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv: toArrayBuffer(iv) },
+    aesKey,
+    toArrayBuffer(plaintext)
+  );
+  plaintext.fill(0);
+
+  const record: EncryptedVaultEnvelope = {
+    version: 1,
+    userId,
+    kdf: 'PBKDF2-SHA256',
+    iterations: PBKDF2_ITERATIONS,
+    cipher: 'AES-256-GCM',
+    saltB64: bytesToB64(salt),
+    ivB64: bytesToB64(iv),
+    ciphertextB64: bytesToB64(new Uint8Array(ciphertextBuf)),
+    publicBundle: {
+      encryptionPublicKey: bundle.encryptionPublicKey,
+      signingPublicKey: bundle.signingPublicKey,
+      fingerprint: bundle.fingerprint,
+      keyVersion: bundle.keyVersion,
+    },
+    updatedAt: new Date().toISOString(),
   };
 
-  await encryptAndSaveVault(expectedUserId, localVaultPassword, data.bundle);
-  return data.bundle;
+  await putVaultRecord(record);
+}
+
+export async function unlockEncryptedVault(
+  userId: string,
+  passphrase: string
+): Promise<IdentityKeyBundle> {
+  const record = await getVaultRecord(userId);
+  if (!record) {
+    throw new Error('No encrypted local key vault found on this device.');
+  }
+
+  const salt = b64ToBytes(record.saltB64);
+  const iv = b64ToBytes(record.ivB64);
+  const ciphertext = b64ToBytes(record.ciphertextB64);
+  const aesKey = await deriveVaultWrappingKey(passphrase, salt, record.iterations || PBKDF2_ITERATIONS);
+
+  try {
+    const decryptedBuf = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: toArrayBuffer(iv) },
+      aesKey,
+      toArrayBuffer(ciphertext)
+    );
+    const jsonText = new TextDecoder().decode(new Uint8Array(decryptedBuf));
+    return JSON.parse(jsonText) as IdentityKeyBundle;
+  } catch {
+    throw new Error('Incorrect vault passphrase or corrupted key backup.');
+  }
+}
+
+export async function exportEncryptedVaultBackup(userId: string): Promise<string> {
+  const record = await getVaultRecord(userId);
+  if (!record) {
+    throw new Error('No local encrypted key vault exists for export.');
+  }
+  return JSON.stringify(record, null, 2);
+}
+
+export async function importEncryptedVaultBackup(
+  userId: string,
+  backupJson: string,
+  passphrase: string
+): Promise<IdentityKeyBundle> {
+  let parsed: EncryptedVaultEnvelope;
+  try {
+    parsed = JSON.parse(backupJson) as EncryptedVaultEnvelope;
+  } catch {
+    throw new Error('Backup file is not valid JSON.');
+  }
+
+  if (!parsed || parsed.version !== 1 || !parsed.saltB64 || !parsed.ivB64 || !parsed.ciphertextB64) {
+    throw new Error('Invalid CipherLine encrypted vault backup format.');
+  }
+
+  const normalized: EncryptedVaultEnvelope = {
+    ...parsed,
+    userId,
+    updatedAt: new Date().toISOString(),
+  };
+
+  const salt = b64ToBytes(normalized.saltB64);
+  const iv = b64ToBytes(normalized.ivB64);
+  const ciphertext = b64ToBytes(normalized.ciphertextB64);
+  const aesKey = await deriveVaultWrappingKey(
+    passphrase,
+    salt,
+    normalized.iterations || PBKDF2_ITERATIONS
+  );
+
+  let bundle: IdentityKeyBundle;
+  try {
+    const decryptedBuf = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: toArrayBuffer(iv) },
+      aesKey,
+      toArrayBuffer(ciphertext)
+    );
+    bundle = JSON.parse(new TextDecoder().decode(new Uint8Array(decryptedBuf))) as IdentityKeyBundle;
+  } catch {
+    throw new Error('Incorrect passphrase for this encrypted vault backup.');
+  }
+
+  await putVaultRecord(normalized);
+  return bundle;
+}
+
+export async function deleteLocalVault(userId: string): Promise<void> {
+  try {
+    localStorage.removeItem(`cipherline_vault_${userId}`);
+  } catch {
+    // Ignore
+  }
+  const db = await openVaultDB();
+  if (!db) return;
+  await new Promise<void>((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).delete(userId);
+      tx.oncomplete = () => {
+        db.close();
+        resolve();
+      };
+      tx.onerror = () => {
+        db.close();
+        resolve();
+      };
+    } catch {
+      db.close();
+      resolve();
+    }
+  });
 }
 
 export function getVerifiedContacts(ownerUserId: string): Record<string, VerifiedContactRecord> {
   try {
-    const raw = localStorage.getItem(`${VERIFIED_CONTACTS_PREFIX}${ownerUserId}`);
+    const raw = localStorage.getItem(`cipherline_verified_contacts_${ownerUserId}`);
     if (!raw) return {};
     return JSON.parse(raw) as Record<string, VerifiedContactRecord>;
   } catch {
@@ -301,31 +316,31 @@ export function getVerifiedContacts(ownerUserId: string): Record<string, Verifie
   }
 }
 
-export function setContactVerified(
+export function saveVerifiedContact(
   ownerUserId: string,
   record: VerifiedContactRecord
 ): Record<string, VerifiedContactRecord> {
-  const current = getVerifiedContacts(ownerUserId);
-  const next = { ...current, [record.userId]: record };
+  const existing = getVerifiedContacts(ownerUserId);
+  const next = { ...existing, [record.userId]: record };
   try {
-    localStorage.setItem(`${VERIFIED_CONTACTS_PREFIX}${ownerUserId}`, JSON.stringify(next));
+    localStorage.setItem(`cipherline_verified_contacts_${ownerUserId}`, JSON.stringify(next));
   } catch {
-    // Ignore storage errors
+    // Ignore
   }
   return next;
 }
 
-export function removeContactVerification(
+export function removeVerifiedContact(
   ownerUserId: string,
-  contactUserId: string
+  peerUserId: string
 ): Record<string, VerifiedContactRecord> {
-  const current = getVerifiedContacts(ownerUserId);
-  const next = { ...current };
-  delete next[contactUserId];
+  const existing = getVerifiedContacts(ownerUserId);
+  const next = { ...existing };
+  delete next[peerUserId];
   try {
-    localStorage.setItem(`${VERIFIED_CONTACTS_PREFIX}${ownerUserId}`, JSON.stringify(next));
+    localStorage.setItem(`cipherline_verified_contacts_${ownerUserId}`, JSON.stringify(next));
   } catch {
-    // Ignore storage errors
+    // Ignore
   }
   return next;
 }

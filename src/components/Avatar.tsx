@@ -1,53 +1,52 @@
 interface AvatarProps {
-  username: string;
+  username?: string;
   isOnline?: boolean;
-  showPresence?: boolean;
   size?: 'sm' | 'md' | 'lg';
 }
 
-const PALETTE = [
+const PALETTES = [
   'bg-teal-700 text-white',
-  'bg-slate-700 text-white',
-  'bg-indigo-700 text-white',
+  'bg-slate-800 text-white',
   'bg-cyan-800 text-white',
   'bg-emerald-800 text-white',
-  'bg-sky-800 text-white',
+  'bg-indigo-800 text-white',
+  'bg-stone-700 text-white',
 ];
 
-function pickColor(username: string): string {
-  let sum = 0;
+function getPaletteIndex(username: string): number {
+  let hash = 0;
   for (let i = 0; i < username.length; i++) {
-    sum += username.charCodeAt(i);
+    hash = (hash * 31 + username.charCodeAt(i)) >>> 0;
   }
-  return PALETTE[sum % PALETTE.length];
+  return hash % PALETTES.length;
 }
 
-export function Avatar({
-  username,
-  isOnline = false,
-  showPresence = false,
-  size = 'md',
-}: AvatarProps) {
-  const initial = (username || '?').slice(0, 2).toUpperCase();
+export function Avatar({ username = 'user', isOnline, size = 'md' }: AvatarProps) {
+  const safeName = username || 'user';
+  const initials = safeName.slice(0, 2).toUpperCase();
+  const paletteClass = PALETTES[getPaletteIndex(safeName)];
+
   const sizeClass =
     size === 'sm'
-      ? 'h-8 w-8 text-xs'
+      ? 'w-8 h-8 text-xs'
       : size === 'lg'
-        ? 'h-12 w-12 text-base'
-        : 'h-10 w-10 text-sm';
+      ? 'w-12 h-12 text-base'
+      : 'w-10 h-10 text-sm';
 
   return (
     <div className="relative inline-flex shrink-0">
       <div
-        className={`${sizeClass} ${pickColor(username)} flex items-center justify-center rounded-full font-display font-semibold tracking-tight select-none`}
+        className={`${sizeClass} ${paletteClass} rounded-lg font-display font-semibold flex items-center justify-center select-none`}
         aria-hidden="true"
       >
-        {initial}
+        {initials}
       </div>
-      {showPresence && isOnline && (
+      {typeof isOnline === 'boolean' && (
         <span
-          className="absolute right-0 bottom-0 h-2.5 w-2.5 rounded-full border-2 border-white bg-emerald-600"
-          title="Online"
+          title={isOnline ? 'Online' : 'Offline'}
+          className={`absolute -bottom-0.5 -right-0.5 w-2.5 h-2.5 rounded-full ring-2 ring-white ${
+            isOnline ? 'bg-emerald-600' : 'bg-slate-300'
+          }`}
         />
       )}
     </div>

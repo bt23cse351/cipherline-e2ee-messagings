@@ -3,12 +3,14 @@ services:
     name: cipherline-e2ee-messaging
     runtime: node
     plan: free
-    buildCommand: npm install && npm run build
-    startCommand: npm start
+    buildCommand: npm install --include=dev && npm run build
+    startCommand: npx tsx server.ts
     healthCheckPath: /api/health
     envVars:
       - key: NODE_ENV
         value: production
+      - key: NODE_VERSION
+        value: 22.20.0
       - key: JWT_SECRET
         generateValue: true
       - key: JWT_EXPIRES_IN

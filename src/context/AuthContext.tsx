@@ -1,226 +1,254 @@
-import React, { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import { generateIdentityKeyBundle } from '../crypto/e2ee';
 import {
-  encryptAndSaveVault,
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useState,
+  type ReactNode,
+} from 'react';
+import { computeSafetyNumber, generateIdentityKeyBundle } from '../crypto/e2ee';
+import {
+  exportEncryptedVaultBackup,
   getVerifiedContacts,
-  hasLocalVault,
+  hasEncryptedVault,
   importEncryptedVaultBackup,
-  removeContactVerification,
-  setContactVerified,
-  unlockLocalVault,
+  removeVerifiedContact,
+  saveEncryptedVault,
+  saveVerifiedContact,
+  unlockEncryptedVault,
 } from '../crypto/keyVault';
-import { api } from '../services/api';
-import { connectSocket, disconnectSocket } from '../services/socket';
+import { api, ApiError } from '../services/api';
 import type {
-  ClientKeyBundle,
-  PublicUser,
+  IdentityKeyBundle,
+  UserProfile,
   VerifiedContactRecord,
 } from '../types/messaging';
-import type { Socket } from 'socket.io-client';
 
 const SESSION_TOKEN_KEY = 'cipherline_session_jwt';
 
 interface AuthContextValue {
-  user: PublicUser | null;
+  user: UserProfile | null;
   token: string | null;
-  keyBundle: ClientKeyBundle | null;
-  vaultStatus: 'locked' | 'unlocked' | 'missing';
-  socket: Socket | null;
-  socketConnected: boolean;
-  initializing: boolean;
+  expiresAt: string | null;
+  identityKeys: IdentityKeyBundle | null;
+  vaultExists: boolean;
+  needsVaultUnlock: boolean;
+  loading: boolean;
   verifiedContacts: Record<string, VerifiedContactRecord>;
-  register: (params: { username: string; email: string; password: string }) => Promise<void>;
-  login: (params: { identifier: string; password: string }) => Promise<void>;
-  unlockVaultWithPassword: (password: string) => Promise<void>;
-  generateAndPublishFreshKeys: (vaultPassword: string) => Promise<void>;
-  importVaultBackup: (
-    backupString: string,
-    backupPassphrase: string,
-    localVaultPassword: string
-  ) => Promise<void>;
-  markContactVerified: (contact: PublicUser) => void;
-  revokeContactVerification: (contactUserId: string) => void;
-  logout: () => Promise<void>;
-  lockVaultMemory: () => void;
+  registerAccount: (params: {
+    username: string;
+    email: string;
+    password: string;
+    vaultPassphrase?: string;
+  }) => Promise<void>;
+  loginAccount: (params: { identifier: string; password: string }) => Promise<void>;
+  logoutAccount: () => Promise<void>;
+  unlockVault: (passphrase: string) => Promise<void>;
+  generateAndPublishKeys: (vaultPassphrase: string) => Promise<void>;
+  importBackupAndUnlock: (backupJson: string, passphrase: string) => Promise<void>;
+  exportVaultBackup: () => Promise<string>;
+  lockVault: () => void;
+  refreshUser: () => Promise<void>;
+  markContactVerified: (peer: UserProfile) => Promise<void>;
+  unverifyContact: (peerUserId: string) => void;
 }
 
 const AuthContext = createContext<AuthContextValue | null>(null);
 
-export function AuthProvider({ children }: { children: React.ReactNode }) {
-  const [user, setUser] = useState<PublicUser | null>(null);
-  const [token, setToken] = useState<string | null>(() =>
-    sessionStorage.getItem(SESSION_TOKEN_KEY)
-  );
-  const [keyBundle, setKeyBundle] = useState<ClientKeyBundle | null>(null);
-  const [vaultStatus, setVaultStatus] = useState<'locked' | 'unlocked' | 'missing'>('locked');
-  const [socket, setSocket] = useState<Socket | null>(null);
-  const [socketConnected, setSocketConnected] = useState(false);
-  const [initializing, setInitializing] = useState(true);
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<UserProfile | null>(null);
+  const [token, setToken] = useState<string | null>(() => {
+    try {
+      return sessionStorage.getItem(SESSION_TOKEN_KEY);
+    } catch {
+      return null;
+    }
+  });
+  const [expiresAt, setExpiresAt] = useState<string | null>(null);
+  const [identityKeys, setIdentityKeys] = useState<IdentityKeyBundle | null>(null);
+  const [vaultExists, setVaultExists] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [verifiedContacts, setVerifiedContacts] = useState<
     Record<string, VerifiedContactRecord>
   >({});
 
-  const clearSessionState = useCallback(() => {
-    sessionStorage.removeItem(SESSION_TOKEN_KEY);
-    disconnectSocket();
-    setSocket(null);
-    setSocketConnected(false);
-    setToken(null);
-    setUser(null);
-    setKeyBundle(null);
-    setVaultStatus('locked');
-    setVerifiedContacts({});
+  const persistSessionToken = useCallback((nextToken: string | null) => {
+    setToken(nextToken);
+    try {
+      if (nextToken) {
+        sessionStorage.setItem(SESSION_TOKEN_KEY, nextToken);
+      } else {
+        sessionStorage.removeItem(SESSION_TOKEN_KEY);
+      }
+    } catch {
+      // Ignore sessionStorage restrictions
+    }
   }, []);
 
-  const attachSocketListeners = useCallback((sock: Socket) => {
-    sock.on('connect', () => setSocketConnected(true));
-    sock.on('disconnect', () => setSocketConnected(false));
-    sock.on('connect_error', (err) => {
-      if (err.message.toLowerCase().includes('token')) {
-        clearSessionState();
-      }
-    });
-  }, [clearSessionState]);
+  const syncVaultPresence = useCallback(async (userId: string) => {
+    const exists = await hasEncryptedVault(userId);
+    setVaultExists(exists);
+    setVerifiedContacts(getVerifiedContacts(userId));
+  }, []);
 
-  // Restore session on page refresh (vault stays locked until user enters password,
-  // because unencrypted private keys are never persisted to disk)
+  const refreshUser = useCallback(async () => {
+    if (!token) return;
+    const { user: fetchedUser } = await api.getMe(token);
+    setUser(fetchedUser);
+    await syncVaultPresence(fetchedUser.id);
+  }, [token, syncVaultPresence]);
+
   useEffect(() => {
     let active = true;
-    const restore = async () => {
-      const savedToken = sessionStorage.getItem(SESSION_TOKEN_KEY);
-      if (!savedToken) {
-        if (active) setInitializing(false);
+
+    async function hydrateSession() {
+      if (!token) {
+        if (active) setLoading(false);
         return;
       }
-
       try {
-        const { user: fetchedUser } = await api.getMe(savedToken);
+        const { user: fetchedUser } = await api.getMe(token);
         if (!active) return;
-
         setUser(fetchedUser);
-        setToken(savedToken);
-        setVerifiedContacts(getVerifiedContacts(fetchedUser.id));
-
-        const exists = await hasLocalVault(fetchedUser.id);
-        setVaultStatus(exists ? 'locked' : 'missing');
-
-        const sock = connectSocket(savedToken);
-        attachSocketListeners(sock);
-        setSocket(sock);
-      } catch {
-        if (active) clearSessionState();
+        await syncVaultPresence(fetchedUser.id);
+      } catch (err) {
+        if (!active) return;
+        if (err instanceof ApiError && err.status === 401) {
+          persistSessionToken(null);
+          setUser(null);
+          setIdentityKeys(null);
+        }
       } finally {
-        if (active) setInitializing(false);
+        if (active) setLoading(false);
       }
-    };
+    }
 
-    restore();
+    void hydrateSession();
     return () => {
       active = false;
     };
-  }, [attachSocketListeners, clearSessionState]);
+  }, [token, persistSessionToken, syncVaultPresence]);
 
-  const register = useCallback(
-    async ({
-      username,
-      email,
-      password,
-    }: {
+  const registerAccount = useCallback(
+    async (params: {
       username: string;
       email: string;
       password: string;
+      vaultPassphrase?: string;
     }) => {
-      // 1. Generate X25519 + Ed25519 keys purely on the client device
       const bundle = await generateIdentityKeyBundle(1);
-
-      // 2. Register user & publish ONLY public keys + SHA-256 fingerprint
-      const result = await api.register({
-        username,
-        email,
-        password,
+      const response = await api.register({
+        username: params.username,
+        email: params.email,
+        password: params.password,
         encryptionPublicKey: bundle.encryptionPublicKey,
         signingPublicKey: bundle.signingPublicKey,
         fingerprint: bundle.fingerprint,
       });
 
-      // 3. Encrypt private keys locally in IndexedDB/storage using password-derived AES-GCM key
-      await encryptAndSaveVault(result.user.id, password, bundle);
+      const passphrase = (params.vaultPassphrase || '').trim() || params.password;
+      await saveEncryptedVault(response.user.id, bundle, passphrase);
 
-      sessionStorage.setItem(SESSION_TOKEN_KEY, result.token);
-      setToken(result.token);
-      setUser(result.user);
-      setKeyBundle(bundle);
-      setVaultStatus('unlocked');
-      setVerifiedContacts(getVerifiedContacts(result.user.id));
-
-      const sock = connectSocket(result.token);
-      attachSocketListeners(sock);
-      setSocket(sock);
+      persistSessionToken(response.token);
+      setExpiresAt(response.expiresAt);
+      setUser(response.user);
+      setIdentityKeys(bundle);
+      setVaultExists(true);
+      setVerifiedContacts(getVerifiedContacts(response.user.id));
     },
-    [attachSocketListeners]
+    [persistSessionToken]
   );
 
-  const login = useCallback(
-    async ({ identifier, password }: { identifier: string; password: string }) => {
-      const result = await api.login({ identifier, password });
+  const loginAccount = useCallback(
+    async (params: { identifier: string; password: string }) => {
+      const response = await api.login(params);
+      persistSessionToken(response.token);
+      setExpiresAt(response.expiresAt);
+      setUser(response.user);
+      setVerifiedContacts(getVerifiedContacts(response.user.id));
 
-      sessionStorage.setItem(SESSION_TOKEN_KEY, result.token);
-      setToken(result.token);
-      setUser(result.user);
-      setVerifiedContacts(getVerifiedContacts(result.user.id));
+      const exists = await hasEncryptedVault(response.user.id);
+      setVaultExists(exists);
 
-      const exists = await hasLocalVault(result.user.id);
       if (exists) {
         try {
-          const unlocked = await unlockLocalVault(result.user.id, password);
-          setKeyBundle(unlocked);
-          setVaultStatus('unlocked');
+          const unlocked = await unlockEncryptedVault(response.user.id, params.password);
+          setIdentityKeys(unlocked);
         } catch {
-          setKeyBundle(null);
-          setVaultStatus('locked');
+          setIdentityKeys(null);
         }
       } else {
-        setKeyBundle(null);
-        setVaultStatus('missing');
+        setIdentityKeys(null);
       }
-
-      const sock = connectSocket(result.token);
-      attachSocketListeners(sock);
-      setSocket(sock);
     },
-    [attachSocketListeners]
+    [persistSessionToken]
   );
 
-  const unlockVaultWithPassword = useCallback(
-    async (password: string) => {
-      if (!user) throw new Error('No active user');
-      const unlocked = await unlockLocalVault(user.id, password);
-      setKeyBundle(unlocked);
-      setVaultStatus('unlocked');
+  const logoutAccount = useCallback(async () => {
+    if (token) {
+      await api.logout(token).catch(() => {});
+    }
+    persistSessionToken(null);
+    setExpiresAt(null);
+    setUser(null);
+    setIdentityKeys(null);
+    setVaultExists(false);
+    setVerifiedContacts({});
+  }, [token, persistSessionToken]);
+
+  const unlockVault = useCallback(
+    async (passphrase: string) => {
+      if (!user) throw new Error('No active user session');
+      const bundle = await unlockEncryptedVault(user.id, passphrase);
+      setIdentityKeys(bundle);
+
+      if (
+        token &&
+        (!user.encryptionPublicKey ||
+          user.encryptionPublicKey !== bundle.encryptionPublicKey ||
+          user.signingPublicKey !== bundle.signingPublicKey)
+      ) {
+        const published = await api.publishKeys(token, {
+          encryptionPublicKey: bundle.encryptionPublicKey,
+          signingPublicKey: bundle.signingPublicKey,
+          fingerprint: bundle.fingerprint,
+        });
+        setUser((prev) =>
+          prev
+            ? {
+                ...prev,
+                encryptionPublicKey: published.encryptionPublicKey,
+                signingPublicKey: published.signingPublicKey,
+                fingerprint: published.fingerprint,
+                keyVersion: published.keyVersion,
+              }
+            : prev
+        );
+      }
     },
-    [user]
+    [user, token]
   );
 
-  const generateAndPublishFreshKeys = useCallback(
-    async (vaultPassword: string) => {
-      if (!user || !token) throw new Error('Not authenticated');
-      const nextVersion = (user.keyVersion || 0) + 1;
-      const freshBundle = await generateIdentityKeyBundle(nextVersion);
+  const generateAndPublishKeys = useCallback(
+    async (vaultPassphrase: string) => {
+      if (!user || !token) throw new Error('Active authenticated session required');
+      const nextVersion = Math.max(1, (user.keyVersion || 0) + (user.encryptionPublicKey ? 1 : 0));
+      const bundle = await generateIdentityKeyBundle(nextVersion);
 
       const published = await api.publishKeys(token, {
-        encryptionPublicKey: freshBundle.encryptionPublicKey,
-        signingPublicKey: freshBundle.signingPublicKey,
-        fingerprint: freshBundle.fingerprint,
+        encryptionPublicKey: bundle.encryptionPublicKey,
+        signingPublicKey: bundle.signingPublicKey,
+        fingerprint: bundle.fingerprint,
       });
 
-      const syncedBundle: ClientKeyBundle = {
-        ...freshBundle,
+      const finalBundle: IdentityKeyBundle = {
+        ...bundle,
         keyVersion: published.keyVersion,
       };
+      await saveEncryptedVault(user.id, finalBundle, vaultPassphrase);
 
-      await encryptAndSaveVault(user.id, vaultPassword, syncedBundle);
-      setKeyBundle(syncedBundle);
-      setVaultStatus('unlocked');
+      setIdentityKeys(finalBundle);
+      setVaultExists(true);
       setUser((prev) =>
         prev
           ? {
@@ -233,85 +261,101 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           : prev
       );
     },
-    [token, user]
+    [user, token]
   );
 
-  const importVaultBackup = useCallback(
-    async (backupString: string, backupPassphrase: string, localVaultPassword: string) => {
-      if (!user) throw new Error('Not authenticated');
-      const imported = await importEncryptedVaultBackup(
-        user.id,
-        backupPassphrase,
-        backupString,
-        localVaultPassword
-      );
-      setKeyBundle(imported);
-      setVaultStatus('unlocked');
+  const importBackupAndUnlock = useCallback(
+    async (backupJson: string, passphrase: string) => {
+      if (!user || !token) throw new Error('Active authenticated session required');
+      const bundle = await importEncryptedVaultBackup(user.id, backupJson, passphrase);
+
+      if (
+        user.encryptionPublicKey !== bundle.encryptionPublicKey ||
+        user.signingPublicKey !== bundle.signingPublicKey
+      ) {
+        const published = await api.publishKeys(token, {
+          encryptionPublicKey: bundle.encryptionPublicKey,
+          signingPublicKey: bundle.signingPublicKey,
+          fingerprint: bundle.fingerprint,
+        });
+        setUser((prev) =>
+          prev
+            ? {
+                ...prev,
+                encryptionPublicKey: published.encryptionPublicKey,
+                signingPublicKey: published.signingPublicKey,
+                fingerprint: published.fingerprint,
+                keyVersion: published.keyVersion,
+              }
+            : prev
+        );
+      }
+
+      setIdentityKeys(bundle);
+      setVaultExists(true);
     },
-    [user]
+    [user, token]
   );
+
+  const exportVaultBackup = useCallback(async () => {
+    if (!user) throw new Error('No authenticated user');
+    return exportEncryptedVaultBackup(user.id);
+  }, [user]);
+
+  const lockVault = useCallback(() => {
+    setIdentityKeys(null);
+  }, []);
 
   const markContactVerified = useCallback(
-    (contact: PublicUser) => {
+    async (peer: UserProfile) => {
       if (!user) return;
-      const next = setContactVerified(user.id, {
-        userId: contact.id,
-        username: contact.username,
-        fingerprint: contact.fingerprint,
-        keyVersion: contact.keyVersion,
+      const myFingerprint = identityKeys?.fingerprint || user.fingerprint;
+      const safetyNumber = await computeSafetyNumber(myFingerprint, peer.fingerprint);
+      const next = saveVerifiedContact(user.id, {
+        userId: peer.id,
+        username: peer.username,
+        fingerprint: peer.fingerprint,
+        safetyNumber,
         verifiedAt: new Date().toISOString(),
       });
       setVerifiedContacts(next);
     },
-    [user]
+    [user, identityKeys]
   );
 
-  const revokeContactVerification = useCallback(
-    (contactUserId: string) => {
+  const unverifyContact = useCallback(
+    (peerUserId: string) => {
       if (!user) return;
-      const next = removeContactVerification(user.id, contactUserId);
+      const next = removeVerifiedContact(user.id, peerUserId);
       setVerifiedContacts(next);
     },
     [user]
   );
 
-  const lockVaultMemory = useCallback(() => {
-    setKeyBundle(null);
-    setVaultStatus('locked');
-  }, []);
-
-  const logout = useCallback(async () => {
-    try {
-      if (token) {
-        await api.logout(token);
-      }
-    } catch {
-      // Always clear local session even if server unreachable
-    } finally {
-      clearSessionState();
-    }
-  }, [clearSessionState, token]);
+  const needsVaultUnlock = Boolean(user && !identityKeys);
 
   return (
     <AuthContext.Provider
       value={{
         user,
         token,
-        keyBundle,
-        vaultStatus,
-        socket,
-        socketConnected,
-        initializing,
+        expiresAt,
+        identityKeys,
+        vaultExists,
+        needsVaultUnlock,
+        loading,
         verifiedContacts,
-        register,
-        login,
-        unlockVaultWithPassword,
-        generateAndPublishFreshKeys,
-        importVaultBackup,
+        registerAccount,
+        loginAccount,
+        logoutAccount,
+        unlockVault,
+        generateAndPublishKeys,
+        importBackupAndUnlock,
+        exportVaultBackup,
+        lockVault,
+        refreshUser,
         markContactVerified,
-        revokeContactVerification,
-        logout,
-        lockVaultMemory,
+        unverifyContact,
       }}
     >
       {children}
